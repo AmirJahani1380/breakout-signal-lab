@@ -12,6 +12,13 @@
         <h1>Breakout Research</h1>
         <p id="legend">Loading chart…</p>
       </header>
+      <section class="selectors" aria-label="Dataset selection">
+        <label for="symbol">Symbol</label>
+        <select id="symbol" disabled>
+          <option value="">Select a symbol</option>
+        </select>
+        <div id="timeframes" aria-label="Available timeframes"></div>
+      </section>
       <section id="chart" aria-label="Candlestick chart"></section>
       <p id="state" role="status">Loading chart…</p>
       <p class="attribution">

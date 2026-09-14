@@ -10,23 +10,23 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from .bars import BarStore, SourceValidationError, load_bars
+from .bars import SourceCatalog, SourceValidationError, discover_source_catalog, load_bars
 
-DEFAULT_SOURCE_PATH = Path(r"C:\Users\amirj\OneDrive\Desktop\Book2.xlsx")
+DEFAULT_DATA_ROOT = Path(
+    r"C:\Users\amirj\OneDrive\Desktop\programming\Trade\data analysis\mt5_data"
+)
 STATIC_DIRECTORY = Path(__file__).parent.parent / "static"
 
 
 @dataclass(frozen=True, slots=True)
 class Settings:
-    source_path: Path
+    data_root: Path
     source_timezone: str = "UTC"
 
     @classmethod
     def from_environment(cls) -> Settings:
         return cls(
-            Path(
-                os.getenv("BARS_SOURCE_PATH", os.getenv("BARS_XLSX_PATH", str(DEFAULT_SOURCE_PATH)))
-            ),
+            Path(os.getenv("BARS_DATA_ROOT", str(DEFAULT_DATA_ROOT))),
             os.getenv("SOURCE_TIMEZONE", "UTC"),
         )
 
@@ -37,27 +37,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         try:
-            app.state.store = load_bars(
-                configured_settings.source_path, configured_settings.source_timezone
-            )
+            app.state.catalog = discover_source_catalog(configured_settings.data_root)
             app.state.source_error = None
         except SourceValidationError as error:
-            app.state.store = None
+            app.state.catalog = None
             app.state.source_error = str(error)
         yield
 
     app = FastAPI(title="Breakout Research Chart Viewer", lifespan=lifespan)
 
+    @app.get("/api/v1/catalog")
+    def catalog() -> dict[str, object]:
+        source_catalog: SourceCatalog | None = app.state.catalog
+        if source_catalog is None:
+            raise HTTPException(
+                status_code=503, detail=app.state.source_error or "data root unavailable"
+            )
+        return {"symbols": source_catalog.symbols()}
+
     @app.get("/api/v1/bars")
     def bars(
+        symbol: str = Query(min_length=1, max_length=100),
+        timeframe: str = Query(min_length=1, max_length=100),
         before: int | None = Query(default=None, description="Exclusive UTC Unix timestamp"),
         limit: int = Query(default=1000, ge=1, le=5000),
     ) -> dict[str, object]:
-        store: BarStore | None = app.state.store
-        if store is None:
+        source_catalog: SourceCatalog | None = app.state.catalog
+        if source_catalog is None:
             raise HTTPException(
-                status_code=503, detail=app.state.source_error or "source unavailable"
+                status_code=503, detail=app.state.source_error or "data root unavailable"
             )
+        try:
+            selection = source_catalog.selection(symbol, timeframe)
+            store = load_bars(selection.source_path, configured_settings.source_timezone)
+        except SourceValidationError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
         page, has_more = store.page(before, limit)
         return {
             "bars": [bar.as_dict() for bar in page],

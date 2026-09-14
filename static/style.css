@@ -15,6 +15,28 @@ header {
   align-items: baseline;
   gap: 20px;
 }
+.selectors {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 12px 0;
+}
+#symbol,
+#timeframes button {
+  background: #1f2430;
+  border: 1px solid #2a2e39;
+  border-radius: 3px;
+  color: inherit;
+  padding: 6px 8px;
+}
+#timeframes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+#timeframes button[aria-pressed="true"] {
+  background: #2962ff;
+}
 h1 {
   font-size: 18px;
   margin: 0;

@@ -13,6 +13,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from openpyxl import load_workbook
 
 REQUIRED_PRICE_COLUMNS = ("time", "open", "high", "low", "close")
+SUPPORTED_SOURCE_SUFFIXES = frozenset({".csv", ".xlsx"})
+EXPORT_NAME_SUFFIXES = ("_max_bars", "-max-bars")
 
 
 class SourceValidationError(ValueError):
@@ -48,6 +50,71 @@ class BarStore:
         end = len(self.bars) if before is None else bisect_left(self.times, before)
         start = max(0, end - limit)
         return self.bars[start:end], start > 0
+
+
+@dataclass(frozen=True, slots=True)
+class DatasetSelection:
+    symbol: str
+    timeframe: str
+    source_path: Path
+
+
+class SourceCatalog:
+    """A filename-only index; bar files are opened only by ``load_bars``."""
+
+    def __init__(self, selections: Iterable[DatasetSelection]) -> None:
+        self._selections = {(entry.symbol, entry.timeframe): entry for entry in selections}
+
+    def symbols(self) -> list[dict[str, object]]:
+        timeframes_by_symbol: dict[str, list[str]] = {}
+        for symbol, timeframe in self._selections:
+            timeframes_by_symbol.setdefault(symbol, []).append(timeframe)
+        return [
+            {"symbol": symbol, "timeframes": sorted(timeframes)}
+            for symbol, timeframes in sorted(timeframes_by_symbol.items())
+        ]
+
+    def selection(self, symbol: str, timeframe: str) -> DatasetSelection:
+        selection = self._selections.get((symbol, timeframe))
+        if selection is None:
+            raise SourceValidationError(f"{symbol}/{timeframe}: dataset is not available")
+        return selection
+
+
+def discover_source_catalog(data_root: Path) -> SourceCatalog:
+    if not data_root.is_dir():
+        raise SourceValidationError(f"{data_root}: data root does not exist or is not a directory")
+    try:
+        files = [path for path in data_root.rglob("*") if path.is_file()]
+    except OSError as error:
+        raise SourceValidationError(f"{data_root}: cannot enumerate data root: {error}") from error
+    selections = [
+        _selection_from_filename(path)
+        for path in files
+        if path.suffix.lower() in SUPPORTED_SOURCE_SUFFIXES
+    ]
+    catalog = SourceCatalog(selection for selection in selections if selection is not None)
+    if not catalog.symbols():
+        raise SourceValidationError(f"{data_root}: no CSV or XLSX symbol_timeframe files found")
+    if len(catalog._selections) != len(
+        [selection for selection in selections if selection is not None]
+    ):
+        raise SourceValidationError(f"{data_root}: duplicate symbol/timeframe filenames found")
+    return catalog
+
+
+def _selection_from_filename(source_path: Path) -> DatasetSelection | None:
+    stem = source_path.stem
+    for suffix in EXPORT_NAME_SUFFIXES:
+        if stem.endswith(suffix):
+            stem = stem[: -len(suffix)]
+            break
+    for separator in ("_", "-"):
+        if separator in stem:
+            symbol, timeframe = stem.rsplit(separator, 1)
+            if symbol and timeframe:
+                return DatasetSelection(symbol, timeframe, source_path)
+    return None
 
 
 def load_bars(source_path: Path, source_timezone: str = "UTC") -> BarStore:
