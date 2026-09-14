@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import socket
 import subprocess
@@ -26,7 +27,17 @@ def viewer_url(tmp_path_factory: pytest.TempPathFactory) -> str:
     root.mkdir()
     write_workbook(
         root / "EURUSD_H1_max_bars.xlsx",
-        [valid(1_735_689_600 + index * 60) for index in range(1_200)],
+        [
+            (
+                1_735_689_600 + index * 60,
+                1,
+                3,
+                0,
+                1.5 + (index % 20) / 20,
+                10,
+            )
+            for index in range(1_200)
+        ],
     )
     write_workbook(
         root / "EURUSD_M15_max_bars.xlsx",
@@ -175,7 +186,16 @@ def test_stale_selection_response_does_not_replace_new_chart(page: Page, viewer_
     page.evaluate(
         "payload => window.__barResponses[1](payload)",
         {
-            "bars": [{"time": 2, "open": 1, "high": 3, "low": 0, "close": 2, "volume": 5}],
+            "bars": [
+                {
+                    "time": 2,
+                    "open": 1,
+                    "high": 3,
+                    "low": 0,
+                    "close": 2,
+                    "volume": 5,
+                }
+            ],
             "next_before": None,
             "has_more": False,
         },
@@ -185,8 +205,22 @@ def test_stale_selection_response_does_not_replace_new_chart(page: Page, viewer_
         "payload => window.__barResponses[0](payload)",
         {
             "bars": [
-                {"time": 1, "open": 1, "high": 3, "low": 0, "close": 2, "volume": 5},
-                {"time": 2, "open": 1, "high": 3, "low": 0, "close": 2, "volume": 5},
+                {
+                    "time": 1,
+                    "open": 1,
+                    "high": 3,
+                    "low": 0,
+                    "close": 2,
+                    "volume": 5,
+                },
+                {
+                    "time": 2,
+                    "open": 1,
+                    "high": 3,
+                    "low": 0,
+                    "close": 2,
+                    "volume": 5,
+                },
             ],
             "next_before": None,
             "has_more": False,
@@ -229,3 +263,133 @@ def test_pagination_error_keeps_the_rendered_chart(page: Page, viewer_url: str) 
     page.get_by_text("Unable to load bars: later unavailable", exact=True).wait_for()
     assert not page.locator("#chart").is_hidden()
     assert page.locator("#chart").get_attribute("data-bar-count") == "120"
+
+
+def test_indicators_tab_applies_hides_and_places_series(page: Page, viewer_url: str) -> None:
+    select_timeframe(page, viewer_url)
+    page.wait_for_function("document.querySelector('#chart').dataset.barCount === '1000'")
+    page.get_by_role("tab", name="Indicators").click()
+    panel = page.get_by_role("tabpanel", name="Indicators")
+    assert panel.is_visible()
+
+    volume = panel.locator('[data-indicator="volume"]')
+    assert volume.locator("[data-indicator-state]").text_content() == "Applied · Visible"
+    volume.get_by_role("button", name="Hide").click()
+    assert volume.locator("[data-indicator-state]").text_content() == "Applied · Hidden"
+    volume.locator("[data-apply]").uncheck()
+    assert volume.locator("[data-indicator-state]").text_content() == "Not applied"
+    point_counts = json.loads(
+        page.locator("#chart").get_attribute("data-indicator-point-counts") or "{}"
+    )
+    assert point_counts["volume"] == 0
+
+    ema = panel.locator('[data-indicator="ema_20"]')
+    ema.locator("[data-apply]").check()
+    assert ema.locator("[data-indicator-state]").text_content() == "Applied · Visible"
+    point_counts = json.loads(
+        page.locator("#chart").get_attribute("data-indicator-point-counts") or "{}"
+    )
+    assert point_counts["ema_20"] == 1000
+
+    rsi = panel.locator('[data-indicator="rsi_14"]')
+    rsi.locator("[data-apply]").check()
+    assert rsi.locator("[data-indicator-state]").text_content() == "Applied · Visible"
+    assert page.evaluate("window.__breakoutChart.panes().length") == 2
+    page.wait_for_function("window.__breakoutChart.panes()[1].getHeight() > 0")
+    assert page.evaluate("window.__breakoutChart.panes()[1].getHeight()") == 160
+    point_counts = json.loads(
+        page.locator("#chart").get_attribute("data-indicator-point-counts") or "{}"
+    )
+    assert point_counts["rsi_14"] == 1000
+    page.wait_for_function(
+        """() => [[255, 152, 0], [171, 71, 188]].every((color) =>
+            [...document.querySelectorAll('#chart canvas')].some((canvas) => {
+                const pixels = canvas.getContext('2d').getImageData(
+                    0, 0, canvas.width, canvas.height).data;
+                for (let index = 0; index < pixels.length; index += 4) {
+                    if (pixels[index] === color[0] && pixels[index + 1] === color[1]
+                        && pixels[index + 2] === color[2]) return true;
+                }
+                return false;
+            }))"""
+    )
+    rsi.locator("[data-apply]").uncheck()
+    assert page.evaluate("window.__breakoutChart.panes().length") == 1
+
+
+def test_server_metadata_adds_an_unknown_indicator_without_frontend_changes(
+    page: Page, viewer_url: str
+) -> None:
+    console_errors: list[str] = []
+    page.on(
+        "console",
+        lambda message: console_errors.append(message.text) if message.type == "error" else None,
+    )
+    bars = [
+        {
+            "time": 1_735_689_600 + index * 900,
+            "open": 1,
+            "high": 3,
+            "low": 0,
+            "close": 2,
+            "volume": 5,
+        }
+        for index in range(3)
+    ]
+    definition = {
+        "id": "custom_signal",
+        "label": "Custom Signal",
+        "description": "Server-defined test pane",
+        "series_type": "LineSeries",
+        "pane": "separate",
+        "default_applied": False,
+        "default_visible": True,
+        "series_options": {"color": "#00ffff", "lineWidth": 2},
+        "price_scale_options": {},
+        "pane_height": 120,
+        "scale_range": [0, 10],
+        "reference_lines": [],
+        "points": [{"time": bar["time"], "value": index + 2} for index, bar in enumerate(bars)],
+    }
+    invalid_definition = {
+        **definition,
+        "id": "broken_signal",
+        "label": "Broken Signal",
+        "series_type": "MissingSeries",
+        "default_applied": True,
+    }
+    page.route(
+        "**/api/v1/bars**",
+        lambda route: route.fulfill(
+            json={
+                "bars": bars,
+                "indicators": [invalid_definition, definition],
+                "next_before": None,
+                "has_more": False,
+            }
+        ),
+    )
+    select_timeframe(page, viewer_url, "M15")
+    page.wait_for_function("document.querySelector('#chart').dataset.barCount === '3'")
+    page.get_by_role("tab", name="Indicators").click()
+    panel = page.get_by_role("tabpanel", name="Indicators")
+    assert (
+        panel.locator('[data-indicator="broken_signal"] [data-indicator-state]').text_content()
+        == "Not applied"
+    )
+    assert any("Unable to create indicator broken_signal" in message for message in console_errors)
+    custom = panel.locator('[data-indicator="custom_signal"]')
+    assert custom.get_by_text("Server-defined test pane").is_visible()
+    custom.locator("[data-apply]").check()
+    page.wait_for_function("window.__breakoutChart.panes()[1]?.getHeight() > 0")
+    assert page.evaluate("window.__breakoutChart.panes()[1].getHeight()") == 120
+    page.wait_for_function(
+        """() => [...document.querySelectorAll('#chart canvas')].some((canvas) => {
+            const pixels = canvas.getContext('2d').getImageData(
+                0, 0, canvas.width, canvas.height).data;
+            for (let index = 0; index < pixels.length; index += 4)
+                if (pixels[index] === 0 && pixels[index + 1] === 255
+                    && pixels[index + 2] === 255) return true;
+            return false;
+        })"""
+    )

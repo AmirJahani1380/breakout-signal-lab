@@ -11,6 +11,7 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .bars import SourceCatalog, SourceValidationError, discover_source_catalog, load_bars
+from .indicators import Indicator, calculate, discover
 
 DEFAULT_DATA_ROOT = Path(
     r"C:\Users\amirj\OneDrive\Desktop\programming\Trade\data analysis\mt5_data"
@@ -36,6 +37,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        app.state.indicators = discover()
         try:
             app.state.catalog = discover_source_catalog(configured_settings.data_root)
             app.state.source_error = None
@@ -73,8 +75,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except SourceValidationError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         page, has_more = store.page(before, limit)
+        page_times = {bar.time for bar in page}
+        indicators: tuple[Indicator, ...] = app.state.indicators
+        indicator_payload = []
+        for indicator in indicators:
+            points = calculate(indicator, store.bars)
+            if points is not None:
+                indicator_payload.append(
+                    indicator.definition([point for point in points if point.time in page_times])
+                )
         return {
             "bars": [bar.as_dict() for bar in page],
+            "indicators": indicator_payload,
             "next_before": page[0].time if has_more and page else None,
             "has_more": has_more,
         }

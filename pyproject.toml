@@ -10,7 +10,7 @@ dependencies = [
 ]
 
 [tool.setuptools]
-packages = ["app"]
+packages = ["app", "app.indicators"]
 
 [project.optional-dependencies]
 dev = [

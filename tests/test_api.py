@@ -69,3 +69,29 @@ def test_missing_root_invalid_selection_and_malformed_selection_are_actionable(
     with TestClient(create_app(Settings(root))) as client:
         response = client.get("/api/v1/bars?symbol=EURUSD&timeframe=M5")
     assert response.status_code == 422 and "missing" in response.json()["detail"]
+
+
+def test_bars_include_backend_calculated_indicators(tmp_path: Path) -> None:
+    rows = [(100 + index, 1, 40, 0, float(index + 1), 10) for index in range(30)]
+    root = market_root(tmp_path, rows)
+    with TestClient(create_app(Settings(root))) as client:
+        latest = client.get("/api/v1/bars?symbol=EURUSD&timeframe=H1&limit=2").json()
+        earlier = client.get(
+            f"/api/v1/bars?symbol=EURUSD&timeframe=H1&limit=2&before={latest['next_before']}"
+        ).json()
+    assert [[bar["time"] for bar in page["bars"]] for page in (latest, earlier)] == [
+        [128, 129],
+        [126, 127],
+    ]
+    for payload in (latest, earlier):
+        definitions = {entry["id"]: entry for entry in payload["indicators"]}
+        assert set(definitions) == {"ema_20", "rsi_14", "volume"}
+        assert [point["value"] for point in definitions["rsi_14"]["points"]] == [100, 100]
+        assert definitions["rsi_14"]["scale_range"] == [0, 100]
+        assert [line["price"] for line in definitions["rsi_14"]["reference_lines"]] == [
+            70,
+            50,
+            30,
+        ]
+        assert definitions["volume"]["default_applied"] is True
+        assert all(isinstance(point["value"], float) for point in definitions["ema_20"]["points"])

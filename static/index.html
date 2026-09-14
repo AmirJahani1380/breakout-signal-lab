@@ -19,6 +19,24 @@
         </select>
         <div id="timeframes" aria-label="Available timeframes"></div>
       </section>
+      <nav class="chart-tabs" aria-label="Chart tools">
+        <button
+          id="indicators-tab"
+          type="button"
+          role="tab"
+          aria-selected="false"
+          aria-controls="indicators-panel"
+        >
+          Indicators
+        </button>
+      </nav>
+      <section
+        id="indicators-panel"
+        class="indicators-panel"
+        role="tabpanel"
+        aria-labelledby="indicators-tab"
+        hidden
+      ></section>
       <section id="chart" aria-label="Candlestick chart"></section>
       <p id="state" role="status">Loading chart…</p>
       <p class="attribution">

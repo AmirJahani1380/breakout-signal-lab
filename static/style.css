@@ -22,7 +22,9 @@ header {
   margin: 12px 0;
 }
 #symbol,
-#timeframes button {
+#timeframes button,
+.chart-tabs button,
+.indicator button {
   background: #1f2430;
   border: 1px solid #2a2e39;
   border-radius: 3px;
@@ -37,6 +39,43 @@ header {
 #timeframes button[aria-pressed="true"] {
   background: #2962ff;
 }
+.chart-tabs {
+  border-bottom: 1px solid #2a2e39;
+}
+.chart-tabs button[aria-selected="true"] {
+  background: #2962ff;
+}
+.indicators-panel {
+  position: absolute;
+  z-index: 100;
+  width: min(520px, calc(100% - 32px));
+  padding: 8px;
+  background: #1f2430;
+  border: 1px solid #363a45;
+  box-shadow: 0 4px 16px #0008;
+}
+.indicator {
+  display: grid;
+  grid-template-columns: minmax(140px, 1fr) auto auto minmax(110px, auto);
+  align-items: center;
+  gap: 12px;
+  padding: 8px;
+}
+.indicator + .indicator {
+  border-top: 1px solid #363a45;
+}
+.indicator small {
+  display: block;
+  color: #9598a1;
+}
+.indicator [data-indicator-state] {
+  color: #9598a1;
+  font-size: 12px;
+  text-align: right;
+}
+.indicator button:disabled {
+  opacity: 0.45;
+}
 h1 {
   font-size: 18px;
   margin: 0;
@@ -48,7 +87,7 @@ h1 {
   font-size: 13px;
 }
 #chart {
-  height: calc(100vh - 120px);
+  height: calc(100vh - 155px);
   min-height: 420px;
   border: 1px solid #2a2e39;
 }
