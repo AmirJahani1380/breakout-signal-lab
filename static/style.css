@@ -1,0 +1,45 @@
+:root {
+  color-scheme: dark;
+  font-family: Inter, system-ui, sans-serif;
+  background: #131722;
+  color: #d1d4dc;
+}
+body {
+  margin: 0;
+}
+main {
+  padding: 16px;
+}
+header {
+  display: flex;
+  align-items: baseline;
+  gap: 20px;
+}
+h1 {
+  font-size: 18px;
+  margin: 0;
+}
+#legend,
+#state,
+.attribution {
+  color: #9598a1;
+  font-size: 13px;
+}
+#chart {
+  height: calc(100vh - 120px);
+  min-height: 420px;
+  border: 1px solid #2a2e39;
+}
+#chart[hidden] {
+  display: none;
+}
+#state {
+  min-height: 20px;
+}
+.attribution {
+  text-align: right;
+  margin: 8px 0 0;
+}
+a {
+  color: #2962ff;
+}

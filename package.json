@@ -1,0 +1,15 @@
+{
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "eslint": "^9.0.0",
+    "lightweight-charts": "5.2.0",
+    "prettier": "^3.0.0",
+    "typescript": "^5.0.0"
+  },
+  "scripts": {
+    "format:check": "prettier --check static",
+    "lint": "eslint static",
+    "typecheck": "tsc --allowJs --checkJs --noEmit --target ES2022 --lib DOM,ES2022 static/app.js"
+  }
+}

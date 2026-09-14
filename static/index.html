@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Breakout Research</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Breakout Research</h1>
+        <p id="legend">Loading chart…</p>
+      </header>
+      <section id="chart" aria-label="Candlestick chart"></section>
+      <p id="state" role="status">Loading chart…</p>
+      <p class="attribution">
+        Charts by
+        <a href="https://www.tradingview.com/" target="_blank" rel="noreferrer"
+          >TradingView Lightweight Charts™</a
+        >
+      </p>
+    </main>
+    <script src="https://unpkg.com/lightweight-charts@5.2.0/dist/lightweight-charts.standalone.production.js"></script>
+    <script src="/static/app.js"></script>
+  </body>
+</html>
