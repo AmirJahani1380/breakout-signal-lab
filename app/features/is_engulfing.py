@@ -50,4 +50,5 @@ feature = FeatureDefinition(
             None,
         ),
     ),
+    calculation_warm_up=1,
 )

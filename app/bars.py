@@ -1,8 +1,14 @@
 from __future__ import annotations
 
 import csv
+import hashlib
+import os
+import sqlite3
+import tempfile
+import time
 from bisect import bisect_left
 from collections.abc import Iterable, Sequence
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from itertools import chain
@@ -12,15 +18,39 @@ from typing import Any, NoReturn
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pandas as pd
+import pyarrow.parquet as pq
 from openpyxl import load_workbook
 
 REQUIRED_PRICE_COLUMNS = ("time", "open", "high", "low", "close")
 SUPPORTED_SOURCE_SUFFIXES = frozenset({".csv", ".parquet", ".xlsx"})
 EXPORT_NAME_SUFFIXES = ("_max_bars", "-max-bars")
+PARQUET_CACHE_VERSION = 1
+PARQUET_CACHE_CLEANUP_LIMIT = 256
 
 
 class SourceValidationError(ValueError):
     """A source workbook cannot safely be used."""
+
+
+class _DecodedBinaryLines:
+    """Expose decoded physical lines while retaining byte positions for csv.reader."""
+
+    def __init__(self, source_file: Any, encoding: str = "utf-8") -> None:
+        self.source_file = source_file
+        self.encoding = encoding
+
+    def __iter__(self) -> _DecodedBinaryLines:
+        return self
+
+    def __next__(self) -> str:
+        line = self.source_file.readline()
+        if not line:
+            raise StopIteration
+        return str(line.decode(self.encoding))
+
+    @property
+    def position(self) -> int:
+        return int(self.source_file.tell())
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +98,381 @@ class BarStore:
         end = len(self.bars) if before is None else bisect_left(self.times, before)
         start = max(0, end - limit)
         return self.bars[start:end], start > 0
+
+
+@dataclass(frozen=True, slots=True)
+class BarPage:
+    """A bounded calculation window and its display slice."""
+
+    bars: tuple[Bar, ...]
+    display_start: int
+    has_more: bool
+
+    @property
+    def display_bars(self) -> tuple[Bar, ...]:
+        return self.bars[self.display_start :]
+
+
+class PagedBarReader:
+    """Read bounded chronological windows without materializing a complete dataset."""
+
+    def __init__(self, source_path: Path, source_timezone: str = "UTC") -> None:
+        self.source_path = source_path
+        self.source_timezone = _source_timezone(source_path, source_timezone)
+        self._timestamps: tuple[int, ...] | None = None
+        self._csv_offsets: tuple[int, ...] | None = None
+        self._parquet_cache_path: Path | None = None
+        if source_path.suffix.lower() == ".parquet" and source_path.is_file():
+            self._parquet_cache_path = self._prepare_parquet_cache()
+
+    def page(self, before: int | None, display_limit: int, warm_up: int) -> BarPage:
+        if not self.source_path.is_file():
+            raise SourceValidationError(f"{self.source_path.name}: source file does not exist")
+        suffix = self.source_path.suffix.lower()
+        if suffix == ".csv":
+            return self._csv_page(before, display_limit, warm_up)
+        if suffix == ".parquet":
+            return self._parquet_page(before, display_limit, warm_up)
+        if suffix == ".xlsx":
+            return self._xlsx_page(before, display_limit, warm_up)
+        raise SourceValidationError(f"{self.source_path.name}: unsupported source format")
+
+    def _csv_page(self, before: int | None, display_limit: int, warm_up: int) -> BarPage:
+        timestamps = self._timestamp_index()
+        offsets = self._csv_offsets
+        assert offsets is not None
+        end = len(timestamps) if before is None else bisect_left(timestamps, before)
+        return self._page_from_rows(
+            self._read_csv_rows(offsets, max(0, end - display_limit - warm_up), end),
+            end,
+            display_limit,
+            warm_up,
+        )
+
+    def _build_csv_index(self) -> tuple[int, ...]:
+        try:
+            with self.source_path.open("rb") as source_file:
+                lines = _DecodedBinaryLines(source_file, "utf-8-sig")
+                reader = csv.reader(lines)
+                header = tuple(next(reader, []))
+                normalized_header = tuple(name.strip() for name in header)
+                if len(normalized_header) != len(set(normalized_header)):
+                    raise SourceValidationError(
+                        f"{self.source_path.name}: duplicate column names are not allowed"
+                    )
+                columns = _columns(self.source_path, normalized_header)
+                offsets: list[int] = []
+                timestamps: list[int] = []
+                while True:
+                    record_start = lines.position
+                    try:
+                        row = tuple(next(reader))
+                    except StopIteration:
+                        break
+                    record_number = len(timestamps) + 2
+                    if len(row) != len(header):
+                        raise SourceValidationError(
+                            f"{self.source_path.name}, CSV record {record_number}: expected "
+                            f"{len(header)} fields, found {len(row)}"
+                        )
+                    offsets.append(record_start)
+                    timestamps.append(
+                        _timestamp(
+                            self.source_path,
+                            record_number,
+                            _cell(row, columns["time"]),
+                            self.source_timezone,
+                        )
+                    )
+        except (OSError, UnicodeError, csv.Error, StopIteration) as error:
+            raise SourceValidationError(
+                f"{self.source_path.name}: cannot index CSV: {error}"
+            ) from error
+        self._csv_offsets = tuple(offsets)
+        return tuple(timestamps)
+
+    def _read_csv_rows(
+        self, offsets: tuple[int, ...], start: int, end: int
+    ) -> list[tuple[Any, ...]]:
+        try:
+            with self.source_path.open("rb") as source_file:
+                header = next(csv.reader(_DecodedBinaryLines(source_file, "utf-8-sig")), [])
+                rows = []
+                for row_index in range(start, end):
+                    source_file.seek(offsets[row_index])
+                    rows.append(tuple(next(csv.reader(_DecodedBinaryLines(source_file)))))
+        except (OSError, UnicodeError, csv.Error, StopIteration) as error:
+            raise SourceValidationError(
+                f"{self.source_path.name}: cannot read CSV page: {error}"
+            ) from error
+        return [tuple(header), *rows]
+
+    def _parquet_page(self, before: int | None, display_limit: int, warm_up: int) -> BarPage:
+        timestamps = self._timestamp_index()
+        end = len(timestamps) if before is None else bisect_left(timestamps, before)
+        start = max(0, end - display_limit - warm_up)
+        try:
+            rows = self._read_parquet_rows(start, end - start)
+        except Exception as error:
+            raise SourceValidationError(
+                f"{self.source_path.name}: cannot read Parquet page: {error}"
+            ) from error
+        bars = _parse_rows(
+            self.source_path,
+            [("time", "open", "high", "low", "close", "volume"), *rows],
+            self.source_timezone,
+            source_start_row=start + 2,
+        )
+        display_start = max(0, len(bars) - display_limit)
+        return BarPage(bars, display_start, start + display_start > 0)
+
+    def _read_parquet_rows(self, start: int, count: int) -> list[tuple[Any, ...]]:
+        cache_path = self._parquet_cache_path
+        assert cache_path is not None
+        with closing(sqlite3.connect(cache_path)) as connection:
+            return list(
+                connection.execute(
+                    "SELECT time, open, high, low, close, volume "
+                    "FROM bars WHERE row_number >= ? AND row_number < ? ORDER BY row_number",
+                    (start, start + count),
+                ).fetchall()
+            )
+
+    def _xlsx_page(self, before: int | None, display_limit: int, warm_up: int) -> BarPage:
+        try:
+            workbook = load_workbook(self.source_path, read_only=True, data_only=True)
+        except Exception as error:
+            raise SourceValidationError(
+                f"{self.source_path.name}: cannot read XLSX workbook: {error}"
+            ) from error
+        try:
+            worksheet = workbook.active
+            timestamps = self._timestamp_index()
+            end = len(timestamps) if before is None else bisect_left(timestamps, before)
+            start = max(0, end - display_limit - warm_up)
+            header = tuple(cell.value for cell in worksheet[1])
+            rows = [
+                tuple(row)
+                for row in worksheet.iter_rows(min_row=start + 2, max_row=end + 1, values_only=True)
+            ]
+            return self._page_from_rows([header, *rows], end, display_limit, warm_up)
+        finally:
+            workbook.close()
+
+    def _page_from_rows(
+        self,
+        rows: list[tuple[Any, ...]],
+        end: int,
+        display_limit: int,
+        warm_up: int,
+    ) -> BarPage:
+        source_start = end - (len(rows) - 1)
+        bars = _parse_rows(
+            self.source_path, rows, self.source_timezone, source_start_row=source_start + 2
+        )
+        display_start = max(0, len(bars) - display_limit)
+        return BarPage(bars, display_start, source_start + display_start > 0)
+
+    def _timestamp_index(self) -> tuple[int, ...]:
+        if self._timestamps is not None:
+            return self._timestamps
+        suffix = self.source_path.suffix.lower()
+        if suffix == ".csv":
+            timestamps = self._build_csv_index()
+        elif suffix == ".xlsx":
+            timestamps = self._build_xlsx_index()
+        elif suffix == ".parquet":
+            timestamps = self._build_parquet_index()
+        else:
+            raise SourceValidationError(f"{self.source_path.name}: unsupported source format")
+        _validate_timestamp_index(self.source_path, timestamps)
+        self._timestamps = timestamps
+        return timestamps
+
+    def _build_xlsx_index(self) -> tuple[int, ...]:
+        try:
+            workbook = load_workbook(self.source_path, read_only=True, data_only=True)
+        except Exception as error:
+            raise SourceValidationError(
+                f"{self.source_path.name}: cannot index XLSX workbook: {error}"
+            ) from error
+        try:
+            worksheet = workbook.active
+            columns = _columns(self.source_path, tuple(cell.value for cell in worksheet[1]))
+            time_column = columns["time"] + 1
+            return tuple(
+                _timestamp(self.source_path, row_number, row[0], self.source_timezone)
+                for row_number, row in enumerate(
+                    worksheet.iter_rows(
+                        min_row=2,
+                        min_col=time_column,
+                        max_col=time_column,
+                        values_only=True,
+                    ),
+                    start=2,
+                )
+            )
+        finally:
+            workbook.close()
+
+    def _build_parquet_index(self) -> tuple[int, ...]:
+        try:
+            cache_path = self._parquet_cache_path
+            assert cache_path is not None
+            with closing(sqlite3.connect(cache_path)) as connection:
+                return tuple(
+                    int(row[0])
+                    for row in connection.execute("SELECT time FROM bars ORDER BY row_number")
+                )
+        except SourceValidationError:
+            raise
+        except Exception as error:
+            raise SourceValidationError(
+                f"{self.source_path.name}: cannot index Parquet file: {error}"
+            ) from error
+
+    def _canonical_parquet_columns(self, parquet_file: pq.ParquetFile) -> list[str]:
+        names = parquet_file.schema_arrow.names
+        _columns(self.source_path, tuple(names))
+        volume_name = "volume" if "volume" in names else "tick_volume"
+        return [*REQUIRED_PRICE_COLUMNS, volume_name]
+
+    def _prepare_parquet_cache(self) -> Path:
+        source_stat = self.source_path.stat()
+        resolved_source = str(self.source_path.resolve())
+        identity_values = (
+            resolved_source,
+            source_stat.st_mtime_ns,
+            source_stat.st_size,
+            str(self.source_timezone),
+            PARQUET_CACHE_VERSION,
+        )
+        identity = repr(identity_values).encode()
+        cache_directory = Path(tempfile.gettempdir()) / "breakout-research-parquet"
+        cache_directory.mkdir(parents=True, exist_ok=True)
+        cache_path = cache_directory / f"{hashlib.sha256(identity).hexdigest()}.sqlite3"
+        self._clean_parquet_cache(cache_directory, resolved_source, cache_path)
+        if self._valid_parquet_cache(cache_path, identity_values):
+            return cache_path
+        cache_path.unlink(missing_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f"{cache_path.stem}.", suffix=".tmp", dir=cache_directory
+        )
+        os.close(descriptor)
+        temporary_path = Path(temporary_name)
+        temporary_path.unlink()
+        try:
+            parquet_file = pq.ParquetFile(self.source_path)
+            columns = self._canonical_parquet_columns(parquet_file)
+            connection = sqlite3.connect(temporary_path)
+            try:
+                connection.execute(
+                    "CREATE TABLE bars (row_number INTEGER PRIMARY KEY, time INTEGER NOT NULL, "
+                    "open TEXT, high TEXT, low TEXT, close TEXT, volume TEXT)"
+                )
+                connection.execute(
+                    "CREATE TABLE metadata (source_path TEXT, source_mtime_ns INTEGER, "
+                    "source_size INTEGER, timezone TEXT, cache_version INTEGER)"
+                )
+                connection.execute("INSERT INTO metadata VALUES (?, ?, ?, ?, ?)", identity_values)
+                connection.execute(f"PRAGMA user_version = {PARQUET_CACHE_VERSION}")
+                row_number = 0
+                for batch in parquet_file.iter_batches(columns=columns, batch_size=1_000):
+                    cached_rows = []
+                    for raw_row in zip(*(column.to_pylist() for column in batch.columns)):
+                        timestamp = _timestamp(
+                            self.source_path,
+                            row_number + 2,
+                            raw_row[0],
+                            self.source_timezone,
+                        )
+                        cached_rows.append(
+                            (
+                                row_number,
+                                timestamp,
+                                *(_parquet_cell(value) for value in raw_row[1:]),
+                            )
+                        )
+                        row_number += 1
+                    connection.executemany(
+                        "INSERT INTO bars VALUES (?, ?, ?, ?, ?, ?, ?)", cached_rows
+                    )
+                connection.commit()
+            finally:
+                connection.close()
+            if self._valid_parquet_cache(cache_path, identity_values):
+                temporary_path.unlink(missing_ok=True)
+            else:
+                try:
+                    temporary_path.replace(cache_path)
+                except OSError:
+                    if not self._valid_parquet_cache(cache_path, identity_values):
+                        raise
+                    temporary_path.unlink(missing_ok=True)
+        except Exception as error:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            if isinstance(error, SourceValidationError):
+                raise
+            raise SourceValidationError(
+                f"{self.source_path.name}: cannot prepare Parquet page store: {error}"
+            ) from error
+        return cache_path
+
+    @staticmethod
+    def _valid_parquet_cache(path: Path, identity: tuple[object, ...]) -> bool:
+        if not path.is_file():
+            return False
+        try:
+            with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as connection:
+                if connection.execute("PRAGMA quick_check").fetchone() != ("ok",):
+                    return False
+                if connection.execute("PRAGMA user_version").fetchone() != (PARQUET_CACHE_VERSION,):
+                    return False
+                if tuple(row[1] for row in connection.execute("PRAGMA table_info(bars)")) != (
+                    "row_number",
+                    "time",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume",
+                ):
+                    return False
+                if connection.execute("SELECT COUNT(*) FROM metadata").fetchone() != (1,):
+                    return False
+                if connection.execute("SELECT * FROM metadata").fetchone() != identity:
+                    return False
+                count, minimum, maximum = connection.execute(
+                    "SELECT COUNT(*), MIN(row_number), MAX(row_number) FROM bars"
+                ).fetchone()
+                return (count == 0 and minimum is None and maximum is None) or (
+                    minimum == 0 and maximum == count - 1
+                )
+        except (OSError, sqlite3.Error):
+            return False
+
+    @staticmethod
+    def _clean_parquet_cache(cache_directory: Path, source_path: str, current_cache: Path) -> None:
+        now = time.time()
+        candidates = list(cache_directory.iterdir())[:PARQUET_CACHE_CLEANUP_LIMIT]
+        for candidate in candidates:
+            try:
+                if candidate.suffix == ".tmp" and now - candidate.stat().st_mtime > 86_400:
+                    candidate.unlink(missing_ok=True)
+                    continue
+                if candidate.suffix != ".sqlite3" or candidate == current_cache:
+                    continue
+                with closing(sqlite3.connect(f"file:{candidate}?mode=ro", uri=True)) as connection:
+                    cached_source = connection.execute(
+                        "SELECT source_path FROM metadata"
+                    ).fetchone()
+                if cached_source == (source_path,):
+                    candidate.unlink(missing_ok=True)
+            except (OSError, sqlite3.Error):
+                continue
 
 
 @dataclass(frozen=True, slots=True)
@@ -194,6 +599,7 @@ def _store_from_frame(
     frame: pd.DataFrame,
     source_timezone: ZoneInfo,
     dataset_id: str | None,
+    source_start_row: int = 2,
 ) -> BarStore:
     if not frame.columns.is_unique:
         raise SourceValidationError(f"{source_path.name}: duplicate column names are not allowed")
@@ -203,14 +609,19 @@ def _store_from_frame(
     normalized_frame = frame.copy()
     normalized_frame.columns = pd.Index(names)
     rows = normalized_frame.itertuples(index=False, name=None)
-    bars = _parse_rows(source_path, chain((tuple(names),), rows), source_timezone)
+    bars = _parse_rows(
+        source_path,
+        chain((tuple(names),), rows),
+        source_timezone,
+        source_start_row=source_start_row,
+    )
     canonical_names = {*REQUIRED_PRICE_COLUMNS, "volume", "tick_volume"}
     imported_names = [column for column in names if column not in canonical_names]
     imported = normalized_frame.loc[:, imported_names].copy()
     imported.index = pd.Index(
         [
             _timestamp(source_path, row, value, source_timezone)
-            for row, value in enumerate(normalized_frame["time"], start=2)
+            for row, value in enumerate(normalized_frame["time"], start=source_start_row)
         ],
         dtype="int64",
         name="time",
@@ -273,16 +684,19 @@ def _load_workbook(source_path: Path, source_timezone: ZoneInfo) -> tuple[Bar, .
 
 
 def _parse_rows(
-    source_path: Path, rows: Iterable[Sequence[Any]], source_timezone: ZoneInfo
+    source_path: Path,
+    rows: Iterable[Sequence[Any]],
+    source_timezone: ZoneInfo,
+    source_start_row: int = 2,
 ) -> tuple[Bar, ...]:
     row_iterator = iter(rows)
     header = next(row_iterator, None)
     columns = _columns(source_path, header)
     bars = tuple(
         _parse_bar(source_path, row_number, row, columns, source_timezone)
-        for row_number, row in enumerate(row_iterator, start=2)
+        for row_number, row in enumerate(row_iterator, start=source_start_row)
     )
-    _validate_order(source_path, bars)
+    _validate_order(source_path, bars, source_start_row)
     return bars
 
 
@@ -394,8 +808,14 @@ def _number(source_path: Path, row: int, column: str, value: Any) -> float:
     return number
 
 
-def _validate_order(source_path: Path, bars: tuple[Bar, ...]) -> None:
-    for row_number, (previous, current) in enumerate(zip(bars, bars[1:]), start=3):
+def _parquet_cell(value: Any) -> str | None:
+    return None if value is None else str(value)
+
+
+def _validate_order(source_path: Path, bars: tuple[Bar, ...], source_start_row: int = 2) -> None:
+    for row_number, (previous, current) in enumerate(
+        zip(bars, bars[1:]), start=source_start_row + 1
+    ):
         if current.time == previous.time:
             _error(
                 source_path, row_number, "time", current.time, "duplicates the previous timestamp"
@@ -406,6 +826,20 @@ def _validate_order(source_path: Path, bars: tuple[Bar, ...]) -> None:
                 row_number,
                 "time",
                 current.time,
+                "is earlier than the previous timestamp",
+            )
+
+
+def _validate_timestamp_index(source_path: Path, timestamps: tuple[int, ...]) -> None:
+    for row_number, (previous, current) in enumerate(zip(timestamps, timestamps[1:]), start=3):
+        if current == previous:
+            _error(source_path, row_number, "time", current, "duplicates the previous timestamp")
+        if current < previous:
+            _error(
+                source_path,
+                row_number,
+                "time",
+                current,
                 "is earlier than the previous timestamp",
             )
 

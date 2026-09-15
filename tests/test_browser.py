@@ -13,7 +13,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, sync_playwright
 
-from tests.test_bars import valid, write_workbook
+from tests.test_bars import write_workbook
 
 
 def free_port() -> int:
@@ -42,7 +42,11 @@ def viewer_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
     )
     write_workbook(
         root / "EURUSD_M15_max_bars.xlsx",
-        [valid(1_735_689_600 + index * 900) for index in range(3)],
+        [
+            (1_735_689_600, 2, 3, 0, 1, 5),
+            (1_735_690_500, 1.5, 4, 1, 3.5, 5),
+            (1_735_691_400, 3, 4, 2, 3.2, 5),
+        ],
     )
     port = free_port()
     process = subprocess.Popen(
@@ -287,6 +291,9 @@ def test_indicators_tab_applies_hides_and_places_series(page: Page, viewer_url: 
     ema = panel.locator('[data-indicator="ema_20"]')
     ema.locator("[data-apply]").check()
     assert ema.locator("[data-indicator-state]").text_content() == "Applied · Visible"
+    page.wait_for_function(
+        "JSON.parse(document.querySelector('#chart').dataset.indicatorPointCounts).ema_20 === 1000"
+    )
     point_counts = json.loads(
         page.locator("#chart").get_attribute("data-indicator-point-counts") or "{}"
     )
@@ -295,6 +302,9 @@ def test_indicators_tab_applies_hides_and_places_series(page: Page, viewer_url: 
     rsi = panel.locator('[data-indicator="rsi_14"]')
     rsi.locator("[data-apply]").check()
     assert rsi.locator("[data-indicator-state]").text_content() == "Applied · Visible"
+    page.wait_for_function(
+        "JSON.parse(document.querySelector('#chart').dataset.indicatorPointCounts).rsi_14 === 1000"
+    )
     assert page.evaluate("window.__breakoutChart.panes().length") == 2
     page.wait_for_function("window.__breakoutChart.panes()[1].getHeight() > 0")
     assert page.evaluate("window.__breakoutChart.panes()[1].getHeight()") == 160
@@ -316,6 +326,53 @@ def test_indicators_tab_applies_hides_and_places_series(page: Page, viewer_url: 
     )
     rsi.locator("[data-apply]").uncheck()
     assert page.evaluate("window.__breakoutChart.panes().length") == 1
+
+
+def test_feature_labels_and_engulfing_candle_color_toggle(page: Page, viewer_url: str) -> None:
+    select_timeframe(page, viewer_url, "M15")
+    page.wait_for_function("document.querySelector('#chart').dataset.barCount === '3'")
+    page.get_by_role("tab", name="Indicators").click()
+    panel = page.get_by_role("tabpanel", name="Indicators")
+    assert panel.locator('[data-indicator="ema_20"] small').text_content().startswith("line ·")
+    assert panel.locator('[data-indicator="rsi_14"] small').text_content().startswith("pane ·")
+    assert (
+        panel.locator('[data-indicator="candle_range"] small')
+        .text_content()
+        .startswith("crosshair ·")
+    )
+    engulfing = panel.locator('[data-indicator="is_engulfing"]')
+    assert engulfing.locator("small").text_content().startswith("candle color ·")
+    engulfing.locator("[data-apply]").check()
+    page.wait_for_function("document.querySelector('#chart').dataset.engulfingCount === '1'")
+    page.wait_for_function(
+        """() => [...document.querySelectorAll('#chart canvas')].some((canvas) => {
+            const pixels = canvas.getContext('2d')
+                .getImageData(0, 0, canvas.width, canvas.height).data;
+            for (let index = 0; index < pixels.length; index += 4)
+                if (pixels[index] === 255 && pixels[index + 1] === 214
+                    && pixels[index + 2] === 0) return true;
+            return false;
+        })"""
+    )
+    engulfing.locator("[data-apply]").uncheck()
+    assert page.locator("#chart").get_attribute("data-engulfing-count") == "0"
+
+    candle_range = panel.locator('[data-indicator="candle_range"]')
+    main_series_count = page.evaluate("window.__breakoutChart.panes()[0].getSeries().length")
+    candle_range.locator("[data-apply]").check()
+    page.wait_for_function(
+        """() => window.__breakoutChart.panes()[0].getSeries().length === 2
+            && document.querySelector('[data-indicator="candle_range"] [data-indicator-state]')
+                .textContent.includes('Applied')"""
+    )
+    assert main_series_count == 2
+    page.evaluate(
+        """() => window.__breakoutChart.setCrosshairPosition(
+            3.5, 1735690500, window.__breakoutChart.panes()[0].getSeries()[0])"""
+    )
+    page.wait_for_function("document.querySelector('#legend').textContent.includes('Range 3')")
+    candle_range.locator("[data-apply]").uncheck()
+    assert "Range" not in page.locator("#legend").text_content()
 
 
 def test_server_metadata_adds_an_unknown_indicator_without_frontend_changes(

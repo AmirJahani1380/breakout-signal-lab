@@ -14,13 +14,26 @@ HISTOGRAM = FeatureSpec("macd_histogram", "Float64", version="1")
 
 
 def calculate(bars: Sequence[Bar]) -> FeatureTable:
+    return calculate_selected(bars, frozenset({MACD.name, SIGNAL.name, HISTOGRAM.name}))
+
+
+def calculate_selected(bars: Sequence[Bar], names: frozenset[str]) -> FeatureTable:
     closes = pd.Series([bar.close for bar in bars], dtype="Float64")
     macd = closes.ewm(span=12, adjust=False).mean() - closes.ewm(span=26, adjust=False).mean()
-    signal = macd.ewm(span=9, adjust=False).mean()
+    columns: dict[str, pd.Series] = {}
+    if MACD.name in names:
+        columns[MACD.name] = macd
+    if SIGNAL.name in names or HISTOGRAM.name in names:
+        signal = macd.ewm(span=9, adjust=False).mean()
+        if SIGNAL.name in names:
+            columns[SIGNAL.name] = signal
+        if HISTOGRAM.name in names:
+            columns[HISTOGRAM.name] = macd - signal
+    specs = tuple(spec for spec in (MACD, SIGNAL, HISTOGRAM) if spec.name in names)
     return FeatureTable.from_columns(
-        (MACD, SIGNAL, HISTOGRAM),
+        specs,
         [bar.time for bar in bars],
-        {MACD.name: macd, SIGNAL.name: signal, HISTOGRAM.name: macd - signal},
+        columns,
     )
 
 
@@ -70,4 +83,6 @@ feature = FeatureDefinition(
             pane_height=160,
         ),
     ),
+    calculation_warm_up=100,
+    calculate_selected=calculate_selected,
 )

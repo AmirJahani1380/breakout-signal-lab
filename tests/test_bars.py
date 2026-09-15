@@ -1,10 +1,16 @@
 import csv
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
+import pandas as pd
 import pytest
 from openpyxl import Workbook
 
-from app.bars import SourceValidationError, load_bars
+from app import bars as bars_module
+from app.bars import BarPage, PagedBarReader, SourceValidationError, load_bars
 
 
 def write_workbook(
@@ -162,3 +168,202 @@ def test_lazy_worksheet_failure_has_source_context(
     monkeypatch.setattr("app.bars.load_workbook", lambda *args, **kwargs: BrokenBook())
     with pytest.raises(SourceValidationError, match="broken.xlsx: cannot read XLSX worksheet"):
         load_bars(source)
+
+
+def test_parquet_latest_and_older_pages_project_only_requested_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "EURUSD_H1.parquet"
+    frame = pd.DataFrame(
+        [valid(100 + index) for index in range(2_500)],
+        columns=("time", "open", "high", "low", "close", "volume"),
+    )
+    frame.to_parquet(source, index=False, row_group_size=250)
+    projected_rows: list[int] = []
+    reader = PagedBarReader(source)
+    original_read = reader._read_parquet_rows
+
+    def track_read(start: int, count: int) -> list[tuple[Any, ...]]:
+        rows = original_read(start, count)
+        projected_rows.append(len(rows))
+        return rows
+
+    monkeypatch.setattr(reader, "_read_parquet_rows", track_read)
+    latest = reader.page(None, 1_000, 100)
+    older = reader.page(latest.display_bars[0].time, 1_000, 100)
+
+    assert [bar.time for bar in latest.display_bars] == list(range(1_600, 2_600))
+    assert [bar.time for bar in older.display_bars] == list(range(600, 1_600))
+    assert projected_rows == [1_100, 1_100]
+
+
+def test_single_large_parquet_row_group_projects_only_requested_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "EURUSD_H1.parquet"
+    pd.DataFrame(
+        [valid(100 + index) for index in range(5_000)],
+        columns=("time", "open", "high", "low", "close", "volume"),
+    ).to_parquet(source, index=False, row_group_size=5_000)
+    projected_rows: list[int] = []
+    reader = PagedBarReader(source)
+    original_read = reader._read_parquet_rows
+
+    def track_read(start: int, count: int) -> list[tuple[Any, ...]]:
+        rows = original_read(start, count)
+        projected_rows.append(len(rows))
+        return rows
+
+    monkeypatch.setattr(reader, "_read_parquet_rows", track_read)
+    page = reader.page(None, 1_000, 100)
+
+    assert len(page.bars) == 1_100
+    assert len(page.display_bars) == 1_000
+    assert projected_rows == [1_100]
+
+
+def test_parquet_page_store_is_reused_and_rebuilt_after_source_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "EURUSD_H1.parquet"
+    columns = ("time", "open", "high", "low", "close", "volume")
+    pd.DataFrame([valid(100 + index) for index in range(20)], columns=columns).to_parquet(
+        source, index=False
+    )
+    decoded_batches = 0
+    original_batches = bars_module.pq.ParquetFile.iter_batches
+
+    def track_batches(*args: object, **kwargs: object) -> Any:
+        nonlocal decoded_batches
+        for batch in original_batches(*args, **kwargs):
+            decoded_batches += 1
+            yield batch
+
+    monkeypatch.setattr(bars_module.pq.ParquetFile, "iter_batches", track_batches)
+    first_reader = PagedBarReader(source)
+    first_cache = first_reader._parquet_cache_path
+    first_decoded_batches = decoded_batches
+    second_reader = PagedBarReader(source)
+
+    assert second_reader._parquet_cache_path == first_cache
+    assert decoded_batches == first_decoded_batches
+
+    assert first_cache is not None
+    connection = sqlite3.connect(first_cache)
+    connection.execute("PRAGMA user_version = 0")
+    connection.commit()
+    connection.close()
+    validated_reader = PagedBarReader(source)
+    assert validated_reader._parquet_cache_path == first_cache
+    assert decoded_batches > first_decoded_batches
+    rebuilt_batch_count = decoded_batches
+
+    pd.DataFrame([valid(200 + index) for index in range(25)], columns=columns).to_parquet(
+        source, index=False
+    )
+    rebuilt_reader = PagedBarReader(source)
+
+    assert rebuilt_reader._parquet_cache_path != first_cache
+    assert not first_cache.exists()
+    assert decoded_batches > rebuilt_batch_count
+    assert [bar.time for bar in rebuilt_reader.page(None, 1_000, 0).display_bars] == list(
+        range(200, 225)
+    )
+
+
+def test_concurrent_parquet_page_store_preparation_is_race_safe(tmp_path: Path) -> None:
+    source = tmp_path / "EURUSD_H1.parquet"
+    pd.DataFrame(
+        [valid(100 + index) for index in range(2_000)],
+        columns=("time", "open", "high", "low", "close", "volume"),
+    ).to_parquet(source, index=False, row_group_size=2_000)
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        readers = list(executor.map(lambda _: PagedBarReader(source), range(4)))
+
+    assert len({reader._parquet_cache_path for reader in readers}) == 1
+    assert all(len(reader.page(None, 1_000, 0).display_bars) == 1_000 for reader in readers)
+
+
+@pytest.mark.parametrize("time_kind", ["iso", "datetime", "milliseconds"])
+def test_parquet_cursor_uses_normalized_timestamp_semantics(tmp_path: Path, time_kind: str) -> None:
+    base = 1_735_689_600
+    if time_kind == "iso":
+        times: list[object] = [
+            datetime.fromtimestamp(base + index, UTC).isoformat() for index in range(20)
+        ]
+    elif time_kind == "datetime":
+        times = [datetime.fromtimestamp(base + index, UTC) for index in range(20)]
+    else:
+        times = [(base + index) * 1_000 for index in range(20)]
+    source = tmp_path / f"EURUSD_{time_kind}.parquet"
+    pd.DataFrame(
+        [(time, 1, 3, 0, 2, 10) for time in times],
+        columns=("time", "open", "high", "low", "close", "volume"),
+    ).to_parquet(source, index=False, row_group_size=5)
+
+    page = PagedBarReader(source).page(base + 10, 5, 2)
+
+    assert [bar.time for bar in page.display_bars] == list(range(base + 5, base + 10))
+
+
+def test_arbitrary_xlsx_cursor_uses_index_and_bounded_bar_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = write_workbook(
+        tmp_path / "EURUSD_H1.xlsx", [valid(100 + index) for index in range(1_500)]
+    )
+    parsed_window_sizes: list[int] = []
+    original_page_from_rows = PagedBarReader._page_from_rows
+
+    def track_window(
+        reader: PagedBarReader,
+        rows: list[tuple[object, ...]],
+        end: int,
+        display_limit: int,
+        warm_up: int,
+    ) -> BarPage:
+        parsed_window_sizes.append(len(rows) - 1)
+        return original_page_from_rows(reader, rows, end, display_limit, warm_up)
+
+    monkeypatch.setattr(PagedBarReader, "_page_from_rows", track_window)
+    page = PagedBarReader(source).page(1_000, 100, 10)
+
+    assert [bar.time for bar in page.display_bars] == list(range(900, 1_000))
+    assert parsed_window_sizes == [110]
+
+
+@pytest.mark.parametrize("bad_kind", ["duplicate", "out_of_order"])
+def test_timestamp_index_rejects_errors_outside_page_and_across_boundary(
+    tmp_path: Path, bad_kind: str
+) -> None:
+    rows = [valid(100 + index) for index in range(1_200)]
+    boundary = 200
+    bad_time = rows[boundary - 1][0] if bad_kind == "duplicate" else 1
+    rows[boundary] = valid(bad_time)
+    source = write_csv(tmp_path / "EURUSD_H1.csv", rows)
+
+    with pytest.raises(SourceValidationError, match="duplicates|earlier"):
+        PagedBarReader(source).page(None, 1_000, 0)
+
+
+def test_csv_index_tracks_quoted_multiline_logical_records(tmp_path: Path) -> None:
+    source = tmp_path / "EURUSD_H1.csv"
+    with source.open("w", newline="", encoding="utf-8") as source_file:
+        writer = csv.writer(source_file)
+        writer.writerow(("time", "open", "high", "low", "close", "volume", "note"))
+        writer.writerow((100, 1, 3, 0, 2, 10, "first line\nsecond line"))
+        writer.writerow((101, 1, 3, 0, 2, 10, "ordinary"))
+
+    page = PagedBarReader(source).page(None, 1_000, 0)
+
+    assert [bar.time for bar in page.display_bars] == [100, 101]
+
+
+def test_deep_page_validation_reports_actual_source_row(tmp_path: Path) -> None:
+    rows = [valid(100 + index) for index in range(1_200)]
+    rows[1_100] = (1_200, 5, 4, 0, 2, 10)
+    source = write_csv(tmp_path / "EURUSD_H1.csv", rows)
+
+    with pytest.raises(SourceValidationError, match="spreadsheet row 1102"):
+        PagedBarReader(source).page(None, 100, 0)

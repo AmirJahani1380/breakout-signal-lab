@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+from collections import OrderedDict
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -10,13 +12,20 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from .bars import SourceCatalog, SourceValidationError, discover_source_catalog, load_bars
-from .features import FeatureDefinition, calculate, discover
+from .bars import (
+    PagedBarReader,
+    SourceCatalog,
+    SourceValidationError,
+    discover_source_catalog,
+)
+from .features import FeatureDefinition, FeatureTable, calculate_requested, discover
 
 DEFAULT_DATA_ROOT = Path(
     r"C:\Users\amirj\OneDrive\Desktop\programming\Trade\data analysis\mt5_data"
 )
 STATIC_DIRECTORY = Path(__file__).parent.parent / "static"
+PAGE_SIZE = 1000
+CACHE_CAPACITY = 128
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +47,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.features = discover()
+        app.state.readers = {}
+        app.state.page_cache = OrderedDict()
         try:
             app.state.catalog = discover_source_catalog(configured_settings.data_root)
             app.state.source_error = None
@@ -57,12 +68,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         return {"symbols": source_catalog.symbols()}
 
+    @app.get("/api/v1/features")
+    def features() -> dict[str, object]:
+        definitions: tuple[FeatureDefinition, ...] = app.state.features
+        return {"indicators": _empty_feature_payload(definitions)}
+
     @app.get("/api/v1/bars")
     def bars(
         symbol: str = Query(min_length=1, max_length=100),
         timeframe: str = Query(min_length=1, max_length=100),
         before: int | None = Query(default=None, description="Exclusive UTC Unix timestamp"),
-        limit: int = Query(default=1000, ge=1, le=5000),
+        limit: int = Query(default=PAGE_SIZE, ge=1, le=PAGE_SIZE),
+        features: str | None = Query(
+            default=None, description="Comma-separated enabled feature view identifiers"
+        ),
     ) -> dict[str, object]:
         source_catalog: SourceCatalog | None = app.state.catalog
         if source_catalog is None:
@@ -71,25 +90,102 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         try:
             selection = source_catalog.selection(symbol, timeframe)
-            store = load_bars(selection.source_path, configured_settings.source_timezone)
-        except SourceValidationError as error:
+            source_stat = selection.source_path.stat()
+        except (OSError, SourceValidationError) as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
-        page, has_more = store.page(before, limit)
-        page_times = {bar.time for bar in page}
         definitions: tuple[FeatureDefinition, ...] = app.state.features
+        views = {view.identifier: view for definition in definitions for view in definition.views}
+        if features is None:
+            enabled = set(views)
+        else:
+            enabled = {identifier for identifier in features.split(",") if identifier}
+        unknown = enabled - views.keys()
+        if unknown:
+            raise HTTPException(
+                status_code=422, detail=f"unknown feature identifiers: {sorted(unknown)!r}"
+            )
+        active_definitions = tuple(
+            definition
+            for definition in definitions
+            if any(view.identifier in enabled for view in definition.views)
+        )
+        warm_up = max(
+            (definition.calculation_warm_up for definition in active_definitions), default=0
+        )
+        source_signature = (
+            str(selection.source_path.resolve()),
+            source_stat.st_mtime_ns,
+            source_stat.st_size,
+        )
+        feature_signature = tuple(
+            (
+                tuple(
+                    (spec.name, spec.version, json.dumps(dict(spec.parameters), sort_keys=True))
+                    for spec in definition.specs
+                ),
+                definition.calculation_warm_up,
+            )
+            for definition in active_definitions
+        )
+        cache_key = (source_signature, feature_signature, tuple(sorted(enabled)), before, limit)
+        page_cache: OrderedDict[object, dict[str, object]] = app.state.page_cache
+        cached = page_cache.get(cache_key)
+        if cached is not None:
+            page_cache.move_to_end(cache_key)
+            return cached
+        reader_key = (*source_signature, configured_settings.source_timezone)
+        readers: dict[object, PagedBarReader] = app.state.readers
+        reader = readers.get(reader_key)
+        try:
+            if reader is None:
+                for stale_key in [
+                    key for key in readers if isinstance(key, tuple) and key[0] == reader_key[0]
+                ]:
+                    del readers[stale_key]
+                reader = PagedBarReader(selection.source_path, configured_settings.source_timezone)
+                readers[reader_key] = reader
+            page = reader.page(before, limit, warm_up)
+        except (OSError, SourceValidationError) as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        display_bars = page.display_bars
+        display_times = {bar.time for bar in display_bars}
         feature_payload: list[dict[str, object]] = []
         for definition in definitions:
-            table = calculate(definition, store.bars)
-            if table is not None:
-                feature_payload.extend(
-                    view.definition(table, page_times) for view in definition.views
+            selected_views = tuple(view for view in definition.views if view.identifier in enabled)
+            required_features = frozenset(
+                feature_name
+                for view in selected_views
+                for feature_name in (view.feature_name, view.color_feature)
+                if feature_name is not None
+            )
+            table = (
+                calculate_requested(definition, page.bars, required_features)
+                if selected_views
+                else None
+            )
+            if selected_views and table is None:
+                continue
+            empty_table = FeatureTable.from_columns(
+                definition.specs,
+                (),
+                {spec.name: () for spec in definition.specs},
+            )
+            for view in definition.views:
+                feature_payload.append(
+                    view.definition(table, display_times)
+                    if table is not None and view in selected_views
+                    else view.definition(empty_table)
                 )
-        return {
-            "bars": [bar.as_dict() for bar in page],
+        payload: dict[str, object] = {
+            "bars": [bar.as_dict() for bar in display_bars],
             "indicators": feature_payload,
-            "next_before": page[0].time if has_more and page else None,
-            "has_more": has_more,
+            "next_before": display_bars[0].time if page.has_more and display_bars else None,
+            "has_more": page.has_more,
         }
+        page_cache[cache_key] = payload
+        if len(page_cache) > CACHE_CAPACITY:
+            page_cache.popitem(last=False)
+        return payload
 
     @app.get("/")
     def index() -> FileResponse:
@@ -97,6 +193,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app.mount("/static", StaticFiles(directory=STATIC_DIRECTORY), name="static")
     return app
+
+
+def _empty_feature_payload(
+    definitions: tuple[FeatureDefinition, ...],
+) -> list[dict[str, object]]:
+    payload: list[dict[str, object]] = []
+    for definition in definitions:
+        empty_table = FeatureTable.from_columns(
+            definition.specs, (), {spec.name: () for spec in definition.specs}
+        )
+        payload.extend(view.definition(empty_table) for view in definition.views)
+    return payload
 
 
 app = create_app()

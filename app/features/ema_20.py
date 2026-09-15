@@ -35,4 +35,5 @@ feature = FeatureDefinition(
             },
         ),
     ),
+    calculation_warm_up=100,
 )

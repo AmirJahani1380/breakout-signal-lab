@@ -154,6 +154,16 @@ class FeatureViewSpec:
     reference_lines: tuple[Mapping[str, object], ...] = ()
     color_feature: str | None = None
 
+    @property
+    def visualization(self) -> str:
+        if self.identifier == "is_engulfing":
+            return "candle color"
+        if self.renderer is None:
+            return "crosshair"
+        if self.pane == "separate":
+            return "pane"
+        return self.renderer
+
     def __post_init__(self) -> None:
         if not isinstance(self.identifier, str) or not NAME_PATTERN.fullmatch(self.identifier):
             raise ValueError(
@@ -245,6 +255,7 @@ class FeatureViewSpec:
             "source": feature_spec.source,
             "label": self.label,
             "description": self.description,
+            "visualization": self.visualization,
             "renderer": self.renderer,
             "series_type": series_type,
             "pane": self.pane,
@@ -266,6 +277,18 @@ class FeatureDefinition:
     specs: tuple[FeatureSpec, ...]
     calculate: Callable[[Sequence[Bar]], FeatureTable]
     views: tuple[FeatureViewSpec, ...]
+    calculation_warm_up: int = 0
+    calculate_selected: Callable[[Sequence[Bar], frozenset[str]], FeatureTable] | None = None
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.calculation_warm_up, int)
+            or isinstance(self.calculation_warm_up, bool)
+            or self.calculation_warm_up < 0
+        ):
+            raise ValueError("calculation_warm_up must be a non-negative integer")
+        if self.calculate_selected is not None and not callable(self.calculate_selected):
+            raise ValueError("calculate_selected must be callable")
 
 
 def discover() -> tuple[FeatureDefinition, ...]:
@@ -301,14 +324,50 @@ def discover() -> tuple[FeatureDefinition, ...]:
 
 
 def calculate(definition: FeatureDefinition, bars: Sequence[Bar]) -> FeatureTable | None:
+    return _calculate_and_validate(definition, bars, None)
+
+
+def calculate_requested(
+    definition: FeatureDefinition, bars: Sequence[Bar], feature_names: frozenset[str]
+) -> FeatureTable | None:
+    if not feature_names:
+        raise ValueError("at least one feature must be requested")
+    if not feature_names <= {spec.name for spec in definition.specs}:
+        raise ValueError("requested feature is not produced by this definition")
+    return _calculate_and_validate(definition, bars, feature_names)
+
+
+def _calculate_and_validate(
+    definition: FeatureDefinition,
+    bars: Sequence[Bar],
+    feature_names: frozenset[str] | None,
+) -> FeatureTable | None:
     try:
-        table = definition.calculate(bars)
+        all_feature_names = frozenset(spec.name for spec in definition.specs)
+        if (
+            feature_names is not None
+            and feature_names != all_feature_names
+            and definition.calculate_selected is None
+        ):
+            raise ValueError(
+                "multi-output definitions must implement calculate_selected for partial requests"
+            )
+        table = (
+            definition.calculate_selected(bars, feature_names)
+            if feature_names is not None and definition.calculate_selected is not None
+            else definition.calculate(bars)
+        )
         if not isinstance(table, FeatureTable):
             raise ValueError("calculate() must return a FeatureTable")
         expected_times = tuple(bar.time for bar in bars)
         if table.timestamps != expected_times:
             raise ValueError("feature timestamps must align exactly with source bars")
-        if table.specs != definition.specs:
+        expected_specs = (
+            definition.specs
+            if feature_names is None or definition.calculate_selected is None
+            else tuple(spec for spec in definition.specs if spec.name in feature_names)
+        )
+        if table.specs != expected_specs:
             raise ValueError("calculated feature specs do not match the definition")
         _validate_feature_values(table.specs, table.frame)
         return table

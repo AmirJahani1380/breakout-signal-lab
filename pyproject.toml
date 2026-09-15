@@ -50,5 +50,5 @@ disable = [
 ]
 
 [[tool.mypy.overrides]]
-module = ["openpyxl"]
+module = ["openpyxl", "pyarrow", "pyarrow.*"]
 ignore_missing_imports = true

@@ -11,6 +11,7 @@ from app.features import (
     FeatureTable,
     FeatureViewSpec,
     calculate,
+    calculate_requested,
     discover,
 )
 from app.features.ema_20 import feature as ema_definition
@@ -78,6 +79,14 @@ def test_ema_and_macd_have_expected_named_aligned_columns() -> None:
     assert list(macd.frame) == ["macd", "macd_signal", "macd_histogram"]
     assert macd.timestamps == (100, 101, 102)
     assert macd.frame.iloc[0].tolist() == pytest.approx([0, 0, 0])
+
+
+@pytest.mark.parametrize("feature_name", ["macd", "macd_signal", "macd_histogram"])
+def test_grouped_calculation_returns_only_requested_output(feature_name: str) -> None:
+    table = calculate_requested(macd_definition, bars([1.0, 2.0, 3.0]), frozenset({feature_name}))
+
+    assert table is not None
+    assert list(table.frame) == [feature_name]
 
 
 def test_view_mapping_is_independent_from_crosshair_details() -> None:

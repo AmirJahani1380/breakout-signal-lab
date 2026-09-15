@@ -46,6 +46,7 @@ const candles = chart.addSeries(LightweightCharts.CandlestickSeries, {
 /**
  * @typedef {{time:number, value:number, color?:string}} IndicatorPoint
  * @typedef {{id:string, feature_name:string, source:"computed"|"imported", label:string, description:string,
+ * visualization:string,
  * renderer:"line"|"histogram"|"marker"|null, series_type:string|null,
  * pane:"main"|"separate", default_applied:boolean, default_visible:boolean,
  * show_in_crosshair:boolean,
@@ -196,6 +197,10 @@ function setIndicatorApplied(identifier, applied) {
   }
   updateIndicatorSeries();
   renderIndicatorState(identifier);
+  if (!applied && activeSelection)
+    legend.textContent = `${activeSelection.symbol} ${activeSelection.timeframe}`;
+  if (activeSelection) void refreshIndicators(selectionVersion);
+  redraw();
 }
 
 /** @param {string} identifier */
@@ -227,7 +232,7 @@ function renderIndicatorList() {
     const label = document.createElement("strong");
     const description = document.createElement("small");
     label.textContent = definition.label;
-    description.textContent = definition.description;
+    description.textContent = `${definition.visualization ?? "indicator"} · ${definition.description}`;
     heading.append(label, description);
     const applyLabel = document.createElement("label");
     const apply = document.createElement("input");
@@ -285,15 +290,26 @@ function receiveIndicators(definitions, prepend) {
     renderIndicatorList();
   } else {
     for (const definition of definitions) {
+      const currentPoints = indicatorPoints.get(definition.id) ?? [];
+      const currentTimes = new Set(currentPoints.map((point) => point.time));
       indicatorPoints.set(definition.id, [
-        ...definition.points,
-        ...(indicatorPoints.get(definition.id) ?? []),
+        ...definition.points.filter((point) => !currentTimes.has(point.time)),
+        ...currentPoints,
       ]);
       const current = indicatorDefinitions.find(
         (candidate) => candidate.id === definition.id,
       );
-      if (current)
-        current.values = [...definition.values, ...(current.values ?? [])];
+      if (current) {
+        const currentValueTimes = new Set(
+          (current.values ?? []).map((value) => value.time),
+        );
+        current.values = [
+          ...definition.values.filter(
+            (value) => !currentValueTimes.has(value.time),
+          ),
+          ...(current.values ?? []),
+        ];
+      }
     }
   }
   updateIndicatorSeries();
@@ -309,9 +325,80 @@ let initialized = false;
 /** @type {{symbol:string, timeframe:string} | null} */
 let activeSelection = null;
 let selectionVersion = 0;
+let featureRefreshVersion = 0;
+/** @type {(number | null)[]} */
+let loadedBefores = [];
+
+/** @param {URL} url */
+function addEnabledFeatures(url) {
+  const enabled = [...indicatorStates]
+    .filter(([, featureState]) => featureState.applied)
+    .map(([identifier]) => identifier);
+  if (indicatorStates.size) url.searchParams.set("features", enabled.join(","));
+}
+
+/** @param {number} version */
+async function refreshIndicators(version) {
+  if (!activeSelection || version !== selectionVersion || !loadedBefores.length)
+    return;
+  const refreshVersion = ++featureRefreshVersion;
+  try {
+    let prepend = false;
+    for (const before of loadedBefores) {
+      const url = new URL("/api/v1/bars", window.location.origin);
+      url.searchParams.set("symbol", activeSelection.symbol);
+      url.searchParams.set("timeframe", activeSelection.timeframe);
+      if (before !== null) url.searchParams.set("before", String(before));
+      addEnabledFeatures(url);
+      const response = await fetch(url);
+      if (!response.ok)
+        throw new Error(
+          (await response.json()).detail || `Server error ${response.status}`,
+        );
+      const payload = await response.json();
+      if (
+        version !== selectionVersion ||
+        refreshVersion !== featureRefreshVersion
+      )
+        return;
+      receiveIndicators(payload.indicators ?? [], prepend);
+      prepend = true;
+    }
+    redraw();
+  } catch (error) {
+    if (
+      version === selectionVersion &&
+      refreshVersion === featureRefreshVersion
+    )
+      state.textContent = `Unable to load features: ${error instanceof Error ? error.message : String(error)}`;
+  }
+}
 
 function redraw() {
-  candles.setData(bars);
+  const engulfing = indicatorDefinitions.find(
+    (definition) => definition.id === "is_engulfing",
+  );
+  const engulfingEnabled = indicatorStates.get("is_engulfing")?.applied;
+  const engulfingTimes = new Set(
+    engulfingEnabled
+      ? (engulfing?.values ?? [])
+          .filter((detail) => detail.value === true)
+          .map((detail) => detail.time)
+      : [],
+  );
+  candles.setData(
+    bars.map((bar) =>
+      engulfingTimes.has(bar.time)
+        ? {
+            ...bar,
+            color: "#ffd600",
+            wickColor: "#ffd600",
+            borderColor: "#ffd600",
+          }
+        : bar,
+    ),
+  );
+  chartContainer.dataset.engulfingCount = String(engulfingTimes.size);
   updateIndicatorSeries();
   chartContainer.dataset.barCount = String(bars.length);
 }
@@ -352,6 +439,7 @@ async function load(before, version) {
     url.searchParams.set("symbol", activeSelection.symbol);
     url.searchParams.set("timeframe", activeSelection.timeframe);
     if (before !== null) url.searchParams.set("before", String(before));
+    addEnabledFeatures(url);
     const response = await fetch(url);
     if (!response.ok)
       throw new Error(
@@ -360,9 +448,15 @@ async function load(before, version) {
     const payload = await response.json();
     if (version !== selectionVersion) return;
     const range = chart.timeScale().getVisibleLogicalRange();
-    const olderCount = before === null ? 0 : payload.bars.length;
-    bars = before === null ? payload.bars : [...payload.bars, ...bars];
+    const existingTimes = new Set(bars.map((bar) => bar.time));
+    const olderBars =
+      before === null
+        ? payload.bars
+        : payload.bars.filter((bar) => !existingTimes.has(bar.time));
+    const olderCount = before === null ? 0 : olderBars.length;
+    bars = before === null ? olderBars : [...olderBars, ...bars];
     receiveIndicators(payload.indicators ?? [], before !== null);
+    if (!loadedBefores.includes(before)) loadedBefores.push(before);
     nextBefore = payload.next_before;
     hasMore = payload.has_more;
     redraw();
@@ -422,6 +516,7 @@ function selectTimeframe(symbol, timeframe) {
   nextBefore = null;
   hasMore = true;
   initialized = false;
+  loadedBefores = [];
   legend.textContent = `${symbol} ${timeframe}`;
   redraw();
   timeframes.querySelectorAll("button").forEach((button) => {
@@ -439,6 +534,14 @@ let catalog = [];
 async function loadCatalog() {
   setInitialState("Loading available symbols…");
   try {
+    const featureResponse = await fetch("/api/v1/features");
+    if (!featureResponse.ok)
+      throw new Error(
+        (await featureResponse.json()).detail ||
+          `Server error ${featureResponse.status}`,
+      );
+    const featurePayload = await featureResponse.json();
+    receiveIndicators(featurePayload.indicators ?? [], false);
     const response = await fetch("/api/v1/catalog");
     if (!response.ok)
       throw new Error(
@@ -491,7 +594,11 @@ chart.subscribeCrosshairMove(
         .toISOString()
         .replace(".000Z", "Z");
       const indicatorValues = indicatorDefinitions.flatMap((definition) => {
-        if (!definition.show_in_crosshair) return [];
+        if (
+          !definition.show_in_crosshair ||
+          !indicatorStates.get(definition.id)?.applied
+        )
+          return [];
         const series = indicatorSeries.get(definition.id);
         const indicatorPoint = series && event.seriesData.get(series);
         const value =
