@@ -90,13 +90,20 @@ def test_bars_include_backend_calculated_indicators(tmp_path: Path) -> None:
     for payload in (latest, earlier):
         definitions = {entry["id"]: entry for entry in payload["indicators"]}
         assert set(definitions) == {
+            "body_size",
+            "body_to_range_ratio",
+            "candle_direction",
+            "candle_range",
             "ema_20",
+            "is_engulfing",
+            "lower_wick_size",
             "macd",
             "macd_histogram",
             "macd_signal",
             "rsi_14",
             "volume",
             "volume_up",
+            "upper_wick_size",
         }
         assert [point["value"] for point in definitions["rsi_14"]["points"]] == [100, 100]
         assert definitions["rsi_14"]["scale_range"] == [0, 100]

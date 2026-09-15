@@ -45,7 +45,7 @@ const candles = chart.addSeries(LightweightCharts.CandlestickSeries, {
 
 /**
  * @typedef {{time:number, value:number, color?:string}} IndicatorPoint
- * @typedef {{id:string, feature_name:string, label:string, description:string,
+ * @typedef {{id:string, feature_name:string, source:"computed"|"imported", label:string, description:string,
  * renderer:"line"|"histogram"|"marker"|null, series_type:string|null,
  * pane:"main"|"separate", default_applied:boolean, default_visible:boolean,
  * show_in_crosshair:boolean,

@@ -102,6 +102,7 @@ def test_view_mapping_is_independent_from_crosshair_details() -> None:
     assert rendered["values"] == []
     assert [point["color"] for point in rendered["points"]] == ["#00d08499", "#ff4d6d99"]
     assert detail_only["series_type"] is None and detail_only["points"] == []
+    assert detail_only["source"] == "computed"
     assert detail_only["values"] == [
         {"time": 1, "value": True},
         {"time": 2, "value": False},
@@ -129,7 +130,7 @@ def test_builtin_discovery_has_no_spurious_infrastructure_warning(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     caplog.set_level(logging.WARNING, logger="app.features")
-    assert len(discover()) == 4
+    assert len(discover()) == 11
     assert "Skipping feature module" not in caplog.text
 
 

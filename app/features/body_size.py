@@ -1,0 +1,22 @@
+from __future__ import annotations
+
+from collections.abc import Sequence
+
+from app.bars import Bar
+
+from . import FeatureDefinition, FeatureSpec, FeatureTable, FeatureViewSpec
+from .candle_measurements import measure_candles
+
+SPEC = FeatureSpec("body_size", "Float64")
+
+
+def calculate(bars: Sequence[Bar]) -> FeatureTable:
+    values = measure_candles(bars).body_size
+    return FeatureTable.from_columns((SPEC,), [bar.time for bar in bars], {SPEC.name: values})
+
+
+feature = FeatureDefinition(
+    (SPEC,),
+    calculate,
+    (FeatureViewSpec("body_size", SPEC.name, "Body", "Absolute close-open", None),),
+)

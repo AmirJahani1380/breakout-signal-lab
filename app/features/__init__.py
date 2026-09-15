@@ -31,6 +31,7 @@ class FeatureSpec:
     warm_up: int = 0
     version: str = "1"
     causality: Literal["causal", "non_causal"] = "causal"
+    source: Literal["computed", "imported"] = "computed"
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not NAME_PATTERN.fullmatch(self.name):
@@ -43,6 +44,8 @@ class FeatureSpec:
             raise ValueError("version must be a non-empty string")
         if self.causality not in ("causal", "non_causal"):
             raise ValueError("causality must be 'causal' or 'non_causal'")
+        if self.source not in ("computed", "imported"):
+            raise ValueError("source must be 'computed' or 'imported'")
         try:
             json.dumps(dict(self.parameters), allow_nan=False)
         except (TypeError, ValueError) as error:
@@ -57,6 +60,7 @@ class FeatureSpec:
             "warm_up": self.warm_up,
             "version": self.version,
             "causality": self.causality,
+            "source": self.source,
         }
 
 
@@ -238,6 +242,7 @@ class FeatureViewSpec:
         return {
             "id": self.identifier,
             "feature_name": self.feature_name,
+            "source": feature_spec.source,
             "label": self.label,
             "description": self.description,
             "renderer": self.renderer,
@@ -268,7 +273,11 @@ def discover() -> tuple[FeatureDefinition, ...]:
     names: set[str] = set()
     view_identifiers: set[str] = set()
     for module_info in pkgutil.iter_modules(__path__, f"{__name__}."):
-        if module_info.name == f"{__name__}.view_validation":
+        if module_info.name.rsplit(".", 1)[-1] in {
+            "candle_measurements",
+            "comparison",
+            "view_validation",
+        }:
             continue
         try:
             definition = _validate_definition(

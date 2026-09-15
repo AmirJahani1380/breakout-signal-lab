@@ -5,15 +5,17 @@ from bisect import bisect_left
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from itertools import chain
 from math import isfinite
 from pathlib import Path
 from typing import Any, NoReturn
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import pandas as pd
 from openpyxl import load_workbook
 
 REQUIRED_PRICE_COLUMNS = ("time", "open", "high", "low", "close")
-SUPPORTED_SOURCE_SUFFIXES = frozenset({".csv", ".xlsx"})
+SUPPORTED_SOURCE_SUFFIXES = frozenset({".csv", ".parquet", ".xlsx"})
 EXPORT_NAME_SUFFIXES = ("_max_bars", "-max-bars")
 
 
@@ -42,9 +44,25 @@ class Bar:
 
 
 class BarStore:
-    def __init__(self, bars: Iterable[Bar]) -> None:
+    def __init__(
+        self,
+        bars: Iterable[Bar],
+        imported_features: pd.DataFrame | None = None,
+        dataset_id: str = "",
+    ) -> None:
         self.bars = tuple(bars)
         self.times = tuple(bar.time for bar in self.bars)
+        self.dataset_id = dataset_id
+        self.imported_features = _validated_imported_features(
+            imported_features, self.times, dataset_id
+        )
+
+    @property
+    def canonical_frame(self) -> pd.DataFrame:
+        return pd.DataFrame(
+            [bar.as_dict() for bar in self.bars],
+            columns=("time", "open", "high", "low", "close", "volume"),
+        ).set_index("time")
 
     def page(self, before: int | None, limit: int) -> tuple[tuple[Bar, ...], bool]:
         end = len(self.bars) if before is None else bisect_left(self.times, before)
@@ -95,7 +113,9 @@ def discover_source_catalog(data_root: Path) -> SourceCatalog:
     ]
     catalog = SourceCatalog(selection for selection in selections if selection is not None)
     if not catalog.symbols():
-        raise SourceValidationError(f"{data_root}: no CSV or XLSX symbol_timeframe files found")
+        raise SourceValidationError(
+            f"{data_root}: no CSV, Parquet, or XLSX symbol_timeframe files found"
+        )
     if len(catalog._selections) != len(
         [selection for selection in selections if selection is not None]
     ):
@@ -117,21 +137,117 @@ def _selection_from_filename(source_path: Path) -> DatasetSelection | None:
     return None
 
 
-def load_bars(source_path: Path, source_timezone: str = "UTC") -> BarStore:
+def load_bars(
+    source_path: Path, source_timezone: str = "UTC", dataset_id: str | None = None
+) -> BarStore:
     timezone_info = _source_timezone(source_path, source_timezone)
     if not source_path.is_file():
         raise SourceValidationError(f"{source_path.name}: source file does not exist")
     if source_path.suffix.lower() == ".csv":
-        return BarStore(_load_csv(source_path, timezone_info))
-    return BarStore(_load_workbook(source_path, timezone_info))
+        _validate_csv_rows(source_path)
+        frame = _read_tabular(source_path, "CSV", pd.read_csv)
+        return _store_from_frame(source_path, frame, timezone_info, dataset_id)
+    if source_path.suffix.lower() == ".parquet":
+        frame = _read_tabular(source_path, "Parquet", pd.read_parquet)
+        return _store_from_frame(source_path, frame, timezone_info, dataset_id)
+    if source_path.suffix.lower() == ".xlsx":
+        bars = _load_workbook(source_path, timezone_info)
+        return BarStore(bars, dataset_id=dataset_id or _dataset_id(source_path))
+    raise SourceValidationError(f"{source_path.name}: unsupported source format")
 
 
-def _load_csv(source_path: Path, source_timezone: ZoneInfo) -> tuple[Bar, ...]:
+def _read_tabular(source_path: Path, format_name: str, reader: Any) -> pd.DataFrame:
+    try:
+        frame = reader(source_path)
+    except Exception as error:
+        raise SourceValidationError(
+            f"{source_path.name}: cannot read {format_name} file: {error}"
+        ) from error
+    if not isinstance(frame, pd.DataFrame):
+        raise SourceValidationError(f"{source_path.name}: {format_name} reader returned no table")
+    return frame
+
+
+def _validate_csv_rows(source_path: Path) -> None:
     try:
         with source_path.open(newline="", encoding="utf-8-sig") as source_file:
-            return _parse_rows(source_path, csv.reader(source_file), source_timezone)
+            rows = csv.reader(source_file)
+            header = next(rows, [])
+            if len(header) != len(set(header)):
+                raise SourceValidationError(
+                    f"{source_path.name}: duplicate column names are not allowed"
+                )
+            for row_number, row in enumerate(rows, start=2):
+                if len(row) != len(header):
+                    raise SourceValidationError(
+                        f"{source_path.name}, CSV row {row_number}: expected "
+                        f"{len(header)} fields, found {len(row)}"
+                    )
+    except SourceValidationError:
+        raise
     except (OSError, UnicodeError, csv.Error) as error:
         raise SourceValidationError(f"{source_path.name}: cannot read CSV file: {error}") from error
+
+
+def _store_from_frame(
+    source_path: Path,
+    frame: pd.DataFrame,
+    source_timezone: ZoneInfo,
+    dataset_id: str | None,
+) -> BarStore:
+    if not frame.columns.is_unique:
+        raise SourceValidationError(f"{source_path.name}: duplicate column names are not allowed")
+    names = [str(column).strip() for column in frame.columns]
+    if len(names) != len(set(names)):
+        raise SourceValidationError(f"{source_path.name}: duplicate column names are not allowed")
+    normalized_frame = frame.copy()
+    normalized_frame.columns = pd.Index(names)
+    rows = normalized_frame.itertuples(index=False, name=None)
+    bars = _parse_rows(source_path, chain((tuple(names),), rows), source_timezone)
+    canonical_names = {*REQUIRED_PRICE_COLUMNS, "volume", "tick_volume"}
+    imported_names = [column for column in names if column not in canonical_names]
+    imported = normalized_frame.loc[:, imported_names].copy()
+    imported.index = pd.Index(
+        [
+            _timestamp(source_path, row, value, source_timezone)
+            for row, value in enumerate(normalized_frame["time"], start=2)
+        ],
+        dtype="int64",
+        name="time",
+    )
+    return BarStore(bars, imported, dataset_id or _dataset_id(source_path))
+
+
+def _dataset_id(source_path: Path) -> str:
+    selection = _selection_from_filename(source_path)
+    return (
+        f"{selection.symbol}/{selection.timeframe}" if selection is not None else source_path.stem
+    )
+
+
+def _validated_imported_features(
+    frame: pd.DataFrame | None, timestamps: tuple[int, ...], dataset_id: str
+) -> pd.DataFrame:
+    if frame is None:
+        return pd.DataFrame(index=pd.Index(timestamps, dtype="int64", name="time"))
+    if not frame.columns.is_unique:
+        raise SourceValidationError(f"{dataset_id}: imported feature names must be unique")
+    if tuple(frame.index) != timestamps:
+        raise SourceValidationError(
+            f"{dataset_id}: imported feature timestamps must align exactly with canonical bars"
+        )
+    if any(
+        str(column) in REQUIRED_PRICE_COLUMNS or str(column) in {"volume", "tick_volume"}
+        for column in frame.columns
+    ):
+        raise SourceValidationError(
+            f"{dataset_id}: imported features must not overwrite canonical columns"
+        )
+    validated = frame.copy()
+    validated.index = pd.Index(timestamps, dtype="int64", name="time")
+    validated.attrs["dataset_id"] = dataset_id
+    validated.attrs["feature_sources"] = {str(column): "imported" for column in validated.columns}
+    return validated
 
 
 def _load_workbook(source_path: Path, source_timezone: ZoneInfo) -> tuple[Bar, ...]:
