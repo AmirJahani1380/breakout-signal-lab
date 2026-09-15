@@ -35,6 +35,17 @@ python_version = "3.11"
 strict = true
 files = ["app"]
 
+[tool.pylint.messages_control]
+disable = [
+  "disallowed-name",
+  "missing-class-docstring",
+  "missing-function-docstring",
+  "missing-module-docstring",
+  "protected-access",
+  "redefined-outer-name",
+  "unused-argument",
+]
+
 [[tool.mypy.overrides]]
 module = ["openpyxl"]
 ignore_missing_imports = true

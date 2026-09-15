@@ -130,8 +130,6 @@ def _load_csv(source_path: Path, source_timezone: ZoneInfo) -> tuple[Bar, ...]:
     try:
         with source_path.open(newline="", encoding="utf-8-sig") as source_file:
             return _parse_rows(source_path, csv.reader(source_file), source_timezone)
-    except SourceValidationError:
-        raise
     except (OSError, UnicodeError, csv.Error) as error:
         raise SourceValidationError(f"{source_path.name}: cannot read CSV file: {error}") from error
 

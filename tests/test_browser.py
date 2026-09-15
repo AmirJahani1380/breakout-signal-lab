@@ -6,6 +6,7 @@ import socket
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 import httpx
@@ -22,7 +23,7 @@ def free_port() -> int:
 
 
 @pytest.fixture(scope="module")
-def viewer_url(tmp_path_factory: pytest.TempPathFactory) -> str:
+def viewer_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
     root = tmp_path_factory.mktemp("browser") / "market"
     root.mkdir()
     write_workbook(
@@ -65,7 +66,7 @@ def viewer_url(tmp_path_factory: pytest.TempPathFactory) -> str:
 
 
 @pytest.fixture
-def page(tmp_path: Path) -> Page:
+def page(tmp_path: Path) -> Iterator[Page]:
     asset = Path("node_modules/lightweight-charts/dist/lightweight-charts.standalone.production.js")
     if not asset.is_file():
         pytest.skip("run npm ci before browser smoke tests")
