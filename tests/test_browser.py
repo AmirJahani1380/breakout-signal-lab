@@ -394,3 +394,62 @@ def test_server_metadata_adds_an_unknown_indicator_without_frontend_changes(
             return false;
         })"""
     )
+
+
+def test_marker_renderer_draws_markers_without_adding_a_line_series(
+    page: Page, viewer_url: str
+) -> None:
+    times = [1_735_689_600 + index * 900 for index in range(3)]
+    bars = [
+        {"time": time, "open": 1, "high": 3, "low": 0, "close": 2, "volume": 5} for time in times
+    ]
+    marker = {
+        "id": "entry_marker",
+        "feature_name": "entry_price",
+        "label": "Entry",
+        "description": "Entry marker",
+        "renderer": "marker",
+        "series_type": None,
+        "pane": "main",
+        "show_in_crosshair": True,
+        "default_applied": True,
+        "default_visible": True,
+        "series_options": {
+            "color": "#00ffff",
+            "shape": "square",
+            "position": "atPriceMiddle",
+            "size": 2,
+        },
+        "price_scale_options": {},
+        "pane_height": None,
+        "scale_range": None,
+        "reference_lines": [],
+        "points": [{"time": time, "value": 2} for time in times],
+        "values": [{"time": time, "value": 2} for time in times],
+    }
+    page.route(
+        "**/api/v1/bars**",
+        lambda route: route.fulfill(
+            json={
+                "bars": bars,
+                "indicators": [marker],
+                "next_before": None,
+                "has_more": False,
+            }
+        ),
+    )
+    select_timeframe(page, viewer_url, "M15")
+    page.wait_for_function("document.querySelector('#chart').dataset.markerCount === '3'")
+    page.locator("#chart canvas").first.wait_for()
+    assert page.evaluate("window.__breakoutChart.panes()[0].getSeries().length") == 1
+    page.wait_for_function(
+        """() => [...document.querySelectorAll('#chart canvas')].some((canvas) => {
+            if (!canvas.width || !canvas.height) return false;
+            const pixels = canvas.getContext('2d').getImageData(
+                0, 0, canvas.width, canvas.height).data;
+            for (let index = 0; index < pixels.length; index += 4)
+                if (pixels[index] === 0 && pixels[index + 1] === 255
+                    && pixels[index + 2] === 255) return true;
+            return false;
+        })"""
+    )

@@ -1,9 +1,13 @@
+from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app import bars as bars_module
+from app.bars import Bar
+from app.features import FeatureDefinition, FeatureSpec, FeatureTable, FeatureViewSpec
+from app.features.ema_20 import feature as ema_definition
 from app.main import Settings, create_app
 from tests.test_bars import valid, write_csv, write_workbook
 
@@ -85,7 +89,15 @@ def test_bars_include_backend_calculated_indicators(tmp_path: Path) -> None:
     ]
     for payload in (latest, earlier):
         definitions = {entry["id"]: entry for entry in payload["indicators"]}
-        assert set(definitions) == {"ema_20", "rsi_14", "volume"}
+        assert set(definitions) == {
+            "ema_20",
+            "macd",
+            "macd_histogram",
+            "macd_signal",
+            "rsi_14",
+            "volume",
+            "volume_up",
+        }
         assert [point["value"] for point in definitions["rsi_14"]["points"]] == [100, 100]
         assert definitions["rsi_14"]["scale_range"] == [0, 100]
         assert [line["price"] for line in definitions["rsi_14"]["reference_lines"]] == [
@@ -95,3 +107,32 @@ def test_bars_include_backend_calculated_indicators(tmp_path: Path) -> None:
         ]
         assert definitions["volume"]["default_applied"] is True
         assert all(isinstance(point["value"], float) for point in definitions["ema_20"]["points"])
+
+
+def test_non_finite_feature_is_skipped_without_breaking_valid_features(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    spec = FeatureSpec("bad_score", "Float64")
+
+    def non_finite(bars: Sequence[Bar]) -> FeatureTable:
+        table = FeatureTable.from_columns(
+            (spec,), [bar.time for bar in bars], {spec.name: [1.0] * len(bars)}
+        )
+        table.frame.iloc[-1, 0] = float("inf")
+        return table
+
+    bad_definition = FeatureDefinition(
+        (spec,),
+        non_finite,
+        (FeatureViewSpec("bad_score", spec.name, "Bad", "Invalid output", "line"),),
+    )
+    monkeypatch.setattr("app.main.discover", lambda: (ema_definition, bad_definition))
+    caplog.set_level("WARNING", logger="app.features")
+    root = market_root(tmp_path, [valid(1), valid(2)])
+
+    with TestClient(create_app(Settings(root))) as client:
+        response = client.get("/api/v1/bars?symbol=EURUSD&timeframe=H1")
+
+    assert response.status_code == 200
+    assert [definition["id"] for definition in response.json()["indicators"]] == ["ema_20"]
+    assert "bad_score values must be finite or null" in caplog.text

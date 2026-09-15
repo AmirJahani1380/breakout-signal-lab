@@ -45,11 +45,14 @@ const candles = chart.addSeries(LightweightCharts.CandlestickSeries, {
 
 /**
  * @typedef {{time:number, value:number, color?:string}} IndicatorPoint
- * @typedef {{id:string, label:string, description:string, series_type:string,
+ * @typedef {{id:string, feature_name:string, label:string, description:string,
+ * renderer:"line"|"histogram"|"marker"|null, series_type:string|null,
  * pane:"main"|"separate", default_applied:boolean, default_visible:boolean,
+ * show_in_crosshair:boolean,
  * series_options:Record<string, any>, price_scale_options:Record<string, any>,
  * pane_height:number|null, scale_range:[number, number]|null,
- * reference_lines:Array<Record<string, any>>, points:IndicatorPoint[]}} IndicatorDefinition
+ * reference_lines:Array<Record<string, any>>, points:IndicatorPoint[],
+ * values:Array<{time:number,value:number|boolean}>}} IndicatorDefinition
  */
 
 /** @type {IndicatorDefinition[]} */
@@ -60,11 +63,40 @@ const indicatorStates = new Map();
 const indicatorPoints = new Map();
 /** @type {Map<string, any>} */
 const indicatorSeries = new Map();
+/** @type {Map<string, any>} */
+const indicatorMarkers = new Map();
+
+/** @param {IndicatorDefinition} definition */
+function markerPoints(definition) {
+  const options = definition.series_options;
+  const position = String(options.position ?? "atPriceMiddle");
+  const points = indicatorPoints.get(definition.id) ?? definition.points;
+  return points.map((point) => ({
+    time: point.time,
+    color: String(options.color ?? "#2962ff"),
+    position,
+    shape: String(options.shape ?? "circle"),
+    ...(options.text === undefined ? {} : { text: String(options.text) }),
+    ...(options.size === undefined ? {} : { size: Number(options.size) }),
+    ...(position.startsWith("atPrice") ? { price: point.value } : {}),
+  }));
+}
 
 /** @param {IndicatorDefinition} definition */
 function createIndicatorSeries(definition) {
   const state = indicatorStates.get(definition.id);
-  if (!state) return;
+  if (!state || definition.renderer === null) return;
+  if (definition.renderer === "marker") {
+    indicatorMarkers.set(
+      definition.id,
+      LightweightCharts.createSeriesMarkers(
+        candles,
+        state.visible ? markerPoints(definition) : [],
+      ),
+    );
+    return;
+  }
+  if (definition.series_type === null) return;
   const options = /** @type {Record<string, any>} */ ({
     ...definition.series_options,
     visible: state.visible,
@@ -110,9 +142,21 @@ function updateIndicatorSeries() {
     const state = indicatorStates.get(definition.id);
     const points = indicatorPoints.get(definition.id) ?? [];
     indicatorSeries.get(definition.id)?.setData(points);
+    indicatorMarkers
+      .get(definition.id)
+      ?.setMarkers(
+        state?.applied && state.visible ? markerPoints(definition) : [],
+      );
     pointCounts[definition.id] = state?.applied ? points.length : 0;
   }
   chartContainer.dataset.indicatorPointCounts = JSON.stringify(pointCounts);
+  chartContainer.dataset.markerCount = String(
+    [...indicatorMarkers.keys()].reduce(
+      (total, identifier) =>
+        total + (indicatorPoints.get(identifier)?.length ?? 0),
+      0,
+    ),
+  );
 }
 
 /** @param {string} identifier */
@@ -140,10 +184,15 @@ function setIndicatorApplied(identifier, applied) {
   if (!state || !definition) return;
   state.applied = applied;
   const series = indicatorSeries.get(identifier);
-  if (applied && !series) createIndicatorSeries(definition);
+  const markers = indicatorMarkers.get(identifier);
+  if (applied && !series && !markers) createIndicatorSeries(definition);
   if (!applied && series) {
     chart.removeSeries(series);
     indicatorSeries.delete(identifier);
+  }
+  if (!applied && markers) {
+    markers.setMarkers([]);
+    indicatorMarkers.delete(identifier);
   }
   updateIndicatorSeries();
   renderIndicatorState(identifier);
@@ -152,9 +201,15 @@ function setIndicatorApplied(identifier, applied) {
 /** @param {string} identifier */
 function toggleIndicatorVisibility(identifier) {
   const state = indicatorStates.get(identifier);
-  if (!state?.applied) return;
+  const definition = indicatorDefinitions.find(
+    (candidate) => candidate.id === identifier,
+  );
+  if (!state?.applied || !definition) return;
   state.visible = !state.visible;
   indicatorSeries.get(identifier)?.applyOptions({ visible: state.visible });
+  indicatorMarkers
+    .get(identifier)
+    ?.setMarkers(state.visible ? markerPoints(definition) : []);
   renderIndicatorState(identifier);
 }
 
@@ -206,6 +261,11 @@ function receiveIndicators(definitions, prepend) {
         chart.removeSeries(series);
         indicatorSeries.delete(identifier);
       }
+    for (const [identifier, markers] of indicatorMarkers)
+      if (!identifiers.has(identifier)) {
+        markers.setMarkers([]);
+        indicatorMarkers.delete(identifier);
+      }
     indicatorDefinitions = definitions;
     for (const definition of definitions) {
       if (!indicatorStates.has(definition.id))
@@ -215,18 +275,26 @@ function receiveIndicators(definitions, prepend) {
         });
       indicatorPoints.set(definition.id, definition.points);
       if (
+        definition.renderer !== null &&
         indicatorStates.get(definition.id)?.applied &&
-        !indicatorSeries.has(definition.id)
+        !indicatorSeries.has(definition.id) &&
+        !indicatorMarkers.has(definition.id)
       )
         createIndicatorSeries(definition);
     }
     renderIndicatorList();
   } else {
-    for (const definition of definitions)
+    for (const definition of definitions) {
       indicatorPoints.set(definition.id, [
         ...definition.points,
         ...(indicatorPoints.get(definition.id) ?? []),
       ]);
+      const current = indicatorDefinitions.find(
+        (candidate) => candidate.id === definition.id,
+      );
+      if (current)
+        current.values = [...definition.values, ...(current.values ?? [])];
+    }
   }
   updateIndicatorSeries();
 }
@@ -423,13 +491,17 @@ chart.subscribeCrosshairMove(
         .toISOString()
         .replace(".000Z", "Z");
       const indicatorValues = indicatorDefinitions.flatMap((definition) => {
+        if (!definition.show_in_crosshair) return [];
         const series = indicatorSeries.get(definition.id);
         const indicatorPoint = series && event.seriesData.get(series);
-        return indicatorPoint &&
+        const value =
+          indicatorPoint &&
           typeof indicatorPoint === "object" &&
           "value" in indicatorPoint
-          ? [`${definition.label} ${indicatorPoint.value}`]
-          : [];
+            ? indicatorPoint.value
+            : definition.values.find((detail) => detail.time === event.time)
+                ?.value;
+        return value === undefined ? [] : [`${definition.label} ${value}`];
       });
       legend.textContent = `${time}  O ${point.open} H ${point.high} L ${point.low} C ${point.close}${indicatorValues.length ? `  ${indicatorValues.join("  ")}` : ""}`;
     }

@@ -13,6 +13,7 @@
 - Run tests, formatting, linting, and type checks before completion.
 - Keep README setup and usage instructions accurate.
 - Preserve existing user changes and avoid destructive operations.
+- Try not to leave any erros or warnings as much as possible
 
 Use clear, domain-specific names. Avoid vague names such as data, item, manager, helper, or utils when a precise name is available.
 
