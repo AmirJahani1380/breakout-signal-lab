@@ -38,16 +38,25 @@ def test_selected_dataset_pages_without_loading_another_dataset(
 ) -> None:
     root = market_root(tmp_path, [valid(100 + index) for index in range(6)])
     write_workbook(root / "GBPUSD_H1.xlsx", [valid(1_000)])
-    page_requests: list[tuple[Path, int | None, int, int]] = []
-    original_page = bars_module.PagedBarReader.page
+    loaded_paths: list[Path] = []
+    page_requests: list[tuple[int | None, int, int]] = []
+    original_load = bars_module.load_bars
+    original_page = bars_module.BarStore.page
+
+    def track_load(
+        source_path: Path, source_timezone: str = "UTC", dataset_id: str | None = None
+    ) -> bars_module.BarStore:
+        loaded_paths.append(source_path)
+        return original_load(source_path, source_timezone, dataset_id)
 
     def track_page(
-        reader: bars_module.PagedBarReader, before: int | None, limit: int, warm_up: int
+        store: bars_module.BarStore, before: int | None, limit: int, warm_up: int
     ) -> bars_module.BarPage:
-        page_requests.append((reader.source_path, before, limit, warm_up))
-        return original_page(reader, before, limit, warm_up)
+        page_requests.append((before, limit, warm_up))
+        return original_page(store, before, limit, warm_up)
 
-    monkeypatch.setattr(bars_module.PagedBarReader, "page", track_page)
+    monkeypatch.setattr("app.main.load_bars", track_load)
+    monkeypatch.setattr(bars_module.BarStore, "page", track_page)
     with TestClient(create_app(Settings(root))) as client:
         first = client.get("/api/v1/bars?symbol=EURUSD&timeframe=H1&limit=2").json()
         second = client.get(
@@ -57,14 +66,14 @@ def test_selected_dataset_pages_without_loading_another_dataset(
         [104, 105],
         [102, 103],
     ]
-    assert [request[0] for request in page_requests] == [
+    assert loaded_paths == [
         root / "EURUSD_H1_max_bars.xlsx",
         root / "EURUSD_H1_max_bars.xlsx",
     ]
-    assert all(request[2:] == (2, 100) for request in page_requests)
+    assert page_requests == [(None, 2, 100), (104, 2, 100)]
 
 
-def test_feature_gating_bounded_window_cache_and_source_invalidation(
+def test_feature_gating_bounded_window_and_fresh_source_reads(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     root = tmp_path / "market"
@@ -74,20 +83,20 @@ def test_feature_gating_bounded_window_cache_and_source_invalidation(
         [valid(100 + index) for index in range(1_250)],
     )
     requests: list[tuple[int, int]] = []
-    original_page = bars_module.PagedBarReader.page
+    original_page = bars_module.BarStore.page
 
     def track_page(
-        reader: bars_module.PagedBarReader, before: int | None, limit: int, warm_up: int
+        store: bars_module.BarStore, before: int | None, limit: int, warm_up: int
     ) -> bars_module.BarPage:
-        page = original_page(reader, before, limit, warm_up)
+        page = original_page(store, before, limit, warm_up)
         requests.append((len(page.bars), warm_up))
         return page
 
-    monkeypatch.setattr(bars_module.PagedBarReader, "page", track_page)
+    monkeypatch.setattr(bars_module.BarStore, "page", track_page)
     with TestClient(create_app(Settings(root))) as client:
         url = "/api/v1/bars?symbol=EURUSD&timeframe=H1&features=ema_20,candle_range"
         first = client.get(url).json()
-        cached = client.get(url).json()
+        repeated = client.get(url).json()
         disabled = client.get(
             "/api/v1/bars?symbol=EURUSD&timeframe=H1&features=candle_range"
         ).json()
@@ -100,32 +109,18 @@ def test_feature_gating_bounded_window_cache_and_source_invalidation(
             f"&limit=200&before={first['next_before']}"
         ).json()
         client.get("/api/v1/bars?symbol=EURUSD&timeframe=H1&features=candle_range&limit=500")
-        candle_range_definition = next(
-            definition
-            for definition in client.app.state.features
-            if definition.specs[0].name == "candle_range"
-        )
-        candle_range_spec = candle_range_definition.specs[0]
-        original_version = candle_range_spec.version
-        original_parameters = candle_range_spec.parameters
-        object.__setattr__(candle_range_spec, "version", "cache-test-version")
-        client.get("/api/v1/bars?symbol=EURUSD&timeframe=H1&features=candle_range")
-        object.__setattr__(candle_range_spec, "parameters", {"cache_test": 1})
-        client.get("/api/v1/bars?symbol=EURUSD&timeframe=H1&features=candle_range")
-        object.__setattr__(candle_range_spec, "version", original_version)
-        object.__setattr__(candle_range_spec, "parameters", original_parameters)
         source.touch()
-        invalidated = client.get(url).json()
+        reloaded = client.get(url).json()
 
-    assert first == cached == invalidated
+    assert first == repeated == reloaded
     assert len(first["bars"]) == 1000
     assert requests == [
         (1100, 100),
+        (1100, 100),
+        (1000, 0),
         (1000, 0),
         (200, 0),
         (500, 0),
-        (1000, 0),
-        (1000, 0),
         (1100, 100),
     ]
     assert len(cursor_page["bars"]) == 200
@@ -166,7 +161,7 @@ def test_missing_root_invalid_selection_and_malformed_selection_are_actionable(
         (
             ("time", "open", "high", "low", "close", "volume"),
             [valid(1), (2, 1, 3, 0, 2)],
-            "CSV record 3: expected 6 fields, found 5",
+            "CSV row 3: expected 6 fields, found 5",
         ),
     ],
 )
@@ -201,10 +196,10 @@ def test_unselected_malformed_parquet_does_not_block_valid_dataset(tmp_path: Pat
     assert catalog.status_code == 200
     assert valid_response.status_code == 200
     assert malformed_response.status_code == 422
-    assert "cannot prepare Parquet page store" in malformed_response.json()["detail"]
+    assert "cannot read Parquet file" in malformed_response.json()["detail"]
 
 
-def test_parquet_source_change_preparation_error_returns_422(tmp_path: Path) -> None:
+def test_parquet_source_change_read_error_returns_422(tmp_path: Path) -> None:
     root = tmp_path / "market"
     root.mkdir()
     source = root / "EURUSD_H1.parquet"
@@ -219,7 +214,7 @@ def test_parquet_source_change_preparation_error_returns_422(tmp_path: Path) -> 
         response = client.get("/api/v1/bars?symbol=EURUSD&timeframe=H1")
 
     assert response.status_code == 422
-    assert "cannot prepare Parquet page store" in response.json()["detail"]
+    assert "cannot read Parquet file" in response.json()["detail"]
 
 
 def test_bars_include_backend_calculated_indicators(tmp_path: Path) -> None:

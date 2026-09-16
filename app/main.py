@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import json
 import os
-from collections import OrderedDict
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -13,10 +11,10 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from .bars import (
-    PagedBarReader,
     SourceCatalog,
     SourceValidationError,
     discover_source_catalog,
+    load_bars,
 )
 from .features import FeatureDefinition, FeatureTable, calculate_requested, discover
 
@@ -25,7 +23,6 @@ DEFAULT_DATA_ROOT = Path(
 )
 STATIC_DIRECTORY = Path(__file__).parent.parent / "static"
 PAGE_SIZE = 1000
-CACHE_CAPACITY = 128
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,8 +44,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.features = discover()
-        app.state.readers = {}
-        app.state.page_cache = OrderedDict()
         try:
             app.state.catalog = discover_source_catalog(configured_settings.data_root)
             app.state.source_error = None
@@ -90,7 +85,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             )
         try:
             selection = source_catalog.selection(symbol, timeframe)
-            source_stat = selection.source_path.stat()
         except (OSError, SourceValidationError) as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         definitions: tuple[FeatureDefinition, ...] = app.state.features
@@ -112,39 +106,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         warm_up = max(
             (definition.calculation_warm_up for definition in active_definitions), default=0
         )
-        source_signature = (
-            str(selection.source_path.resolve()),
-            source_stat.st_mtime_ns,
-            source_stat.st_size,
-        )
-        feature_signature = tuple(
-            (
-                tuple(
-                    (spec.name, spec.version, json.dumps(dict(spec.parameters), sort_keys=True))
-                    for spec in definition.specs
-                ),
-                definition.calculation_warm_up,
-            )
-            for definition in active_definitions
-        )
-        cache_key = (source_signature, feature_signature, tuple(sorted(enabled)), before, limit)
-        page_cache: OrderedDict[object, dict[str, object]] = app.state.page_cache
-        cached = page_cache.get(cache_key)
-        if cached is not None:
-            page_cache.move_to_end(cache_key)
-            return cached
-        reader_key = (*source_signature, configured_settings.source_timezone)
-        readers: dict[object, PagedBarReader] = app.state.readers
-        reader = readers.get(reader_key)
         try:
-            if reader is None:
-                for stale_key in [
-                    key for key in readers if isinstance(key, tuple) and key[0] == reader_key[0]
-                ]:
-                    del readers[stale_key]
-                reader = PagedBarReader(selection.source_path, configured_settings.source_timezone)
-                readers[reader_key] = reader
-            page = reader.page(before, limit, warm_up)
+            page = load_bars(selection.source_path, configured_settings.source_timezone).page(
+                before, limit, warm_up
+            )
         except (OSError, SourceValidationError) as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         display_bars = page.display_bars
@@ -182,9 +147,6 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "next_before": display_bars[0].time if page.has_more and display_bars else None,
             "has_more": page.has_more,
         }
-        page_cache[cache_key] = payload
-        if len(page_cache) > CACHE_CAPACITY:
-            page_cache.popitem(last=False)
         return payload
 
     @app.get("/")

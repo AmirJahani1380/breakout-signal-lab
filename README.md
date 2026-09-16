@@ -23,13 +23,11 @@ Open `http://127.0.0.1:8000`, choose a symbol, then choose one of its timeframes
 
 Use the Indicators tab to apply, hide, or remove features. Every control names its visualization: EMA is a line, RSI is a pane, candle range is crosshair-only, and engulfing is candle color. A disabled feature is removed immediately from chart series, candle colors, and crosshair details. Enabling engulfing colors matching candles yellow; disabling it restores the normal up/down colors. Other candle measurements remain crosshair-only and add no chart series.
 
-## Paging, warm-up, and cache policy
+## Loading, paging, and warm-up policy
 
-Each selected source gets a reusable normalized timestamp index. CSV and XLSX indexing reads only timestamps, validates chronological order and duplicates across every page boundary, and makes arbitrary exclusive cursors deterministic after a restart. CSV pages use logical-record byte offsets, including quoted multiline records, while XLSX pages read bounded worksheet row windows. On the first request for a Parquet dataset, the application creates or reuses a versioned, source-identity-keyed SQLite page store in the system temporary directory. Preparation streams canonical rows in batches of at most 1,000 without retaining the complete dataset; API page reads use indexed primary-key ranges to select exactly display plus warm-up rows regardless of source row-group layout. Source changes create a new store and obsolete stores are removed by bounded cleanup. Numeric and OHLCV validation remains page-local, with errors retaining original source row numbers. Preparation and page errors return HTTP 422 for the selected dataset only. Pages remain ascending and do not overlap, so prepending older history introduces no gaps or duplicate timestamps and the browser preserves the visible logical range.
+This experimental app deliberately has no dataset, page, or calculation cache. Each bars request loads the selected CSV, Parquet, or XLSX file with pandas, validates the complete selected dataset, and then slices the requested ascending page in memory. It does not open unselected datasets. Older pages use an exclusive timestamp cursor, so adjacent pages do not overlap and the browser can prepend history without duplicate timestamps. Source and validation errors return HTTP 422 for the selected dataset.
 
 EMA 20, RSI 14, and MACD deliberately use a bounded 100-bar seed window on every page; engulfing uses one preceding candle. These recursive values are deterministic for that declared boundary policy, but they are not claimed to be mathematically identical to calculations seeded from the complete history. At the beginning of a dataset, only the available seed rows are used.
-
-Completed API pages are retained in a bounded in-memory LRU cache. Its key includes the resolved dataset identity, source modification time and size, enabled feature versions and parameters, cursor, and limit. Changing the source, feature metadata/version, enabled set, cursor, or limit produces a new calculation. Restarting the server clears the cache.
 
 ## Feature architecture
 
@@ -44,13 +42,13 @@ Feature dtypes use pandas nullable `Float64`, `Int64`, or `boolean` types so nul
 
 ## CSV, Parquet, and XLSX format
 
-The full-file import API gives CSV and Parquet the same pandas-backed normalization contract. Paged chart access applies the same canonical schema without importing extra Parquet columns. Sources must include exact names `time`, `open`, `high`, `low`, `close`, and either `volume` or `tick_volume` (when both exist, `volume` wins). The first XLSX worksheet uses the same canonical names. Timestamps accept ISO-8601 strings, UTC Unix seconds, or UTC Unix milliseconds; values with sub-second precision are rejected. Naive ISO values use `SOURCE_TIMEZONE`, whose default is `UTC`.
+CSV, Parquet, and XLSX share the same pandas-backed normalization contract. Sources must include exact names `time`, `open`, `high`, `low`, `close`, and either `volume` or `tick_volume` (when both exist, `volume` wins). The first XLSX worksheet uses the same canonical names. Timestamps accept ISO-8601 strings, UTC Unix seconds, or UTC Unix milliseconds; values with sub-second precision are rejected. Naive ISO values use `SOURCE_TIMEZONE`, whose default is `UTC`.
 
 Additional CSV and Parquet columns are retained in `BarStore.imported_features`, indexed by normalized UTC timestamp and marked with imported provenance. They remain separate from canonical bars and computed `FeatureTable` columns, so a vendor column such as `candle_range` cannot overwrite the computed value and is not automatically displayed. Use `imported_feature_column`, `computed_feature_column`, and `compare_feature_columns` from `app.features.comparison` to compare matching columns. Numeric values use configurable relative and absolute tolerances; boolean and categorical values compare exactly. Missing timestamps and differing values are returned in the comparison result without changing either source.
 
 `is_engulfing` is true for a bullish reversal when the previous candle is bearish, the current candle is bullish, its open is strictly inside the previous candle's low/high range, and its close is above the previous high. The bearish rule is the inverse: previous bullish, current bearish, open strictly inside the previous range, and close below the previous low. It only uses the current and preceding bars; all bundled candle calculations are causal.
 
-Selecting a timeframe validates source structure and builds the full timestamp index, including timestamp syntax, chronological order, and duplicates. Numeric price/volume values and OHLC geometry are validated page-locally as each bounded window is read. An unavailable data root returns HTTP 503; an invalid selection or malformed requested page returns a clear HTTP 422 response with its original source row or CSV record number.
+Selecting a timeframe validates the complete selected source, including timestamp syntax and order, duplicate timestamps, numeric price/volume values, and OHLC geometry. An unavailable data root returns HTTP 503; an invalid selection or malformed source returns a clear HTTP 422 response with its original source row or CSV record number.
 
 ## Verification
 
