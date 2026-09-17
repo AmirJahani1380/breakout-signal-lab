@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import os
+import tempfile
+import zipfile
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
+from typing import Literal, cast
 
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from .bars import (
@@ -16,6 +20,7 @@ from .bars import (
     discover_source_catalog,
     load_bars,
 )
+from .feature_export import FeatureExportError, export_bar_features
 from .features import FeatureDefinition, FeatureTable, calculate_requested, discover
 
 DEFAULT_DATA_ROOT = Path(
@@ -66,7 +71,52 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.get("/api/v1/features")
     def features() -> dict[str, object]:
         definitions: tuple[FeatureDefinition, ...] = app.state.features
-        return {"indicators": _empty_feature_payload(definitions)}
+        return {
+            "indicators": _empty_feature_payload(definitions),
+            "export_features": [
+                spec.as_dict() for definition in definitions for spec in definition.specs
+            ],
+        }
+
+    @app.get("/api/v1/export")
+    def export(
+        symbol: str = Query(min_length=1, max_length=100),
+        timeframe: str = Query(min_length=1, max_length=100),
+        features: str = Query(min_length=1),
+        format: str = Query(pattern="^(csv|parquet)$"),
+    ) -> Response:
+        source_catalog: SourceCatalog | None = app.state.catalog
+        if source_catalog is None:
+            raise HTTPException(
+                status_code=503, detail=app.state.source_error or "data root unavailable"
+            )
+        try:
+            selection = source_catalog.selection(symbol, timeframe)
+            names = features.split(",")
+            with tempfile.TemporaryDirectory() as directory:
+                table, sidecar = export_bar_features(
+                    selection.source_path,
+                    Path(directory),
+                    symbol,
+                    timeframe,
+                    names,
+                    cast(Literal["csv", "parquet"], format),
+                    configured_settings.source_timezone,
+                    app.state.features,
+                )
+                archive_bytes = BytesIO()
+                with zipfile.ZipFile(archive_bytes, "w", zipfile.ZIP_DEFLATED) as archive:
+                    archive.write(table, table.name)
+                    archive.write(sidecar, sidecar.name)
+                return Response(
+                    archive_bytes.getvalue(),
+                    media_type="application/zip",
+                    headers={
+                        "Content-Disposition": f'attachment; filename="bar_features_{format}.zip"'
+                    },
+                )
+        except (OSError, SourceValidationError, FeatureExportError) as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
 
     @app.get("/api/v1/bars")
     def bars(

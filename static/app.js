@@ -10,6 +10,12 @@ const symbolElement = document.querySelector("#symbol");
 const timeframesElement = document.querySelector("#timeframes");
 const indicatorsTabElement = document.querySelector("#indicators-tab");
 const indicatorsPanelElement = document.querySelector("#indicators-panel");
+const exportTabElement = document.querySelector("#export-tab");
+const exportPanelElement = document.querySelector("#export-panel");
+const exportFeaturesElement = document.querySelector("#export-features");
+const exportStatusElement = document.querySelector("#export-status");
+const exportCsvElement = document.querySelector("#export-csv");
+const exportParquetElement = document.querySelector("#export-parquet");
 if (
   !(chartElement instanceof HTMLElement) ||
   !stateElement ||
@@ -17,7 +23,13 @@ if (
   !(symbolElement instanceof HTMLSelectElement) ||
   !(timeframesElement instanceof HTMLElement) ||
   !(indicatorsTabElement instanceof HTMLButtonElement) ||
-  !(indicatorsPanelElement instanceof HTMLElement)
+  !(indicatorsPanelElement instanceof HTMLElement) ||
+  !(exportTabElement instanceof HTMLButtonElement) ||
+  !(exportPanelElement instanceof HTMLElement) ||
+  !(exportFeaturesElement instanceof HTMLElement) ||
+  !(exportStatusElement instanceof HTMLElement) ||
+  !(exportCsvElement instanceof HTMLButtonElement) ||
+  !(exportParquetElement instanceof HTMLButtonElement)
 )
   throw new Error("Missing chart UI");
 const chartContainer = chartElement;
@@ -27,6 +39,12 @@ const symbolSelect = symbolElement;
 const timeframes = timeframesElement;
 const indicatorsTab = indicatorsTabElement;
 const indicatorsPanel = indicatorsPanelElement;
+const exportTab = exportTabElement;
+const exportPanel = exportPanelElement;
+const exportFeatures = exportFeaturesElement;
+const exportStatus = exportStatusElement;
+const exportCsv = exportCsvElement;
+const exportParquet = exportParquetElement;
 
 const chart = LightweightCharts.createChart(chartContainer, {
   autoSize: true,
@@ -542,6 +560,15 @@ async function loadCatalog() {
       );
     const featurePayload = await featureResponse.json();
     receiveIndicators(featurePayload.indicators ?? [], false);
+    for (const feature of featurePayload.export_features ?? []) {
+      const label = document.createElement("label");
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.value = feature.name;
+      checkbox.checked = true;
+      label.append(checkbox, ` ${feature.name}`);
+      exportFeatures.append(label);
+    }
     const response = await fetch("/api/v1/catalog");
     if (!response.ok)
       throw new Error(
@@ -580,7 +607,53 @@ indicatorsTab.addEventListener("click", () => {
   const opening = indicatorsPanel.hidden;
   indicatorsPanel.hidden = !opening;
   indicatorsTab.setAttribute("aria-selected", String(opening));
+  exportPanel.hidden = true;
+  exportTab.setAttribute("aria-selected", "false");
 });
+
+exportTab.addEventListener("click", () => {
+  const opening = exportPanel.hidden;
+  exportPanel.hidden = !opening;
+  exportTab.setAttribute("aria-selected", String(opening));
+  indicatorsPanel.hidden = true;
+  indicatorsTab.setAttribute("aria-selected", "false");
+});
+
+/** @param {"csv"|"parquet"} format */
+async function downloadFeatures(format) {
+  if (!activeSelection) {
+    exportStatus.textContent = "Select a dataset first.";
+    return;
+  }
+  const selected = Array.from(
+    exportFeatures.querySelectorAll("input:checked"),
+  ).map((checkbox) => /** @type {HTMLInputElement} */ (checkbox).value);
+  if (!selected.length) {
+    exportStatus.textContent = "Select at least one feature column.";
+    return;
+  }
+  exportStatus.textContent = "Preparing export…";
+  try {
+    const url = new URL("/api/v1/export", location.origin);
+    url.searchParams.set("symbol", activeSelection.symbol);
+    url.searchParams.set("timeframe", activeSelection.timeframe);
+    url.searchParams.set("features", selected.join(","));
+    url.searchParams.set("format", format);
+    const response = await fetch(url);
+    if (!response.ok) throw new Error((await response.json()).detail);
+    const address = URL.createObjectURL(await response.blob());
+    const link = document.createElement("a");
+    link.href = address;
+    link.download = `bar_features_${format}.zip`;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(address), 1000);
+    exportStatus.textContent = "Export downloaded with metadata.";
+  } catch (error) {
+    exportStatus.textContent = `Export failed: ${error instanceof Error ? error.message : String(error)}`;
+  }
+}
+exportCsv.addEventListener("click", () => void downloadFeatures("csv"));
+exportParquet.addEventListener("click", () => void downloadFeatures("parquet"));
 
 chart.subscribeCrosshairMove(
   /** @param {any} event */ (event) => {

@@ -1,16 +1,31 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-
-import pandas as pd
+from dataclasses import dataclass
 
 from app.bars import Bar
 
 from . import FeatureDefinition, FeatureSpec, FeatureTable, FeatureViewSpec
+from .ema_20 import ema_step
 
 MACD = FeatureSpec("macd", "Float64", {"fast_period": 12, "slow_period": 26}, version="1")
 SIGNAL = FeatureSpec("macd_signal", "Float64", {"period": 9}, version="1")
 HISTOGRAM = FeatureSpec("macd_histogram", "Float64", version="1")
+
+
+@dataclass(slots=True)
+class MacdState:
+    fast: float | None = None
+    slow: float | None = None
+    signal: float | None = None
+
+    def add(self, close: float, needs_signal: bool) -> tuple[float, float | None]:
+        self.fast = ema_step(self.fast, close, 12)
+        self.slow = ema_step(self.slow, close, 26)
+        macd = self.fast - self.slow
+        if needs_signal:
+            self.signal = ema_step(self.signal, macd, 9)
+        return macd, self.signal
 
 
 def calculate(bars: Sequence[Bar]) -> FeatureTable:
@@ -18,17 +33,18 @@ def calculate(bars: Sequence[Bar]) -> FeatureTable:
 
 
 def calculate_selected(bars: Sequence[Bar], names: frozenset[str]) -> FeatureTable:
-    closes = pd.Series([bar.close for bar in bars], dtype="Float64")
-    macd = closes.ewm(span=12, adjust=False).mean() - closes.ewm(span=26, adjust=False).mean()
-    columns: dict[str, pd.Series] = {}
-    if MACD.name in names:
-        columns[MACD.name] = macd
-    if SIGNAL.name in names or HISTOGRAM.name in names:
-        signal = macd.ewm(span=9, adjust=False).mean()
-        if SIGNAL.name in names:
-            columns[SIGNAL.name] = signal
-        if HISTOGRAM.name in names:
-            columns[HISTOGRAM.name] = macd - signal
+    columns: dict[str, list[float]] = {name: [] for name in names}
+    state = MacdState()
+    for bar in bars:
+        macd, signal = state.add(bar.close, SIGNAL.name in names or HISTOGRAM.name in names)
+        if MACD.name in names:
+            columns[MACD.name].append(macd)
+        if SIGNAL.name in names or HISTOGRAM.name in names:
+            assert signal is not None
+            if SIGNAL.name in names:
+                columns[SIGNAL.name].append(signal)
+            if HISTOGRAM.name in names:
+                columns[HISTOGRAM.name].append(macd - signal)
     specs = tuple(spec for spec in (MACD, SIGNAL, HISTOGRAM) if spec.name in names)
     return FeatureTable.from_columns(
         specs,

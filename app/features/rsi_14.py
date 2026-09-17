@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 from app.bars import Bar
 
@@ -10,23 +11,45 @@ PERIOD = 14
 SPEC = FeatureSpec("rsi_14", "Float64", {"period": PERIOD}, warm_up=PERIOD, version="1")
 
 
+@dataclass(slots=True)
+class Rsi14State:
+    previous_close: float | None = None
+    count: int = 0
+    gain_sum: float = 0.0
+    loss_sum: float = 0.0
+    average_gain: float | None = None
+    average_loss: float | None = None
+
+    def add(self, close: float) -> float | None:
+        if self.previous_close is None:
+            self.previous_close = close
+            return None
+        change = close - self.previous_close
+        self.previous_close = close
+        self.count += 1
+        gain, loss = max(change, 0), max(-change, 0)
+        if self.count <= PERIOD:
+            self.gain_sum += gain
+            self.loss_sum += loss
+            if self.count == PERIOD:
+                self.average_gain = self.gain_sum / PERIOD
+                self.average_loss = self.loss_sum / PERIOD
+        else:
+            assert self.average_gain is not None and self.average_loss is not None
+            self.average_gain = (self.average_gain * (PERIOD - 1) + gain) / PERIOD
+            self.average_loss = (self.average_loss * (PERIOD - 1) + loss) / PERIOD
+        if self.average_gain is None or self.average_loss is None:
+            return None
+        if self.average_gain == self.average_loss == 0:
+            return 50.0
+        if self.average_loss == 0:
+            return 100.0
+        return 100 - 100 / (1 + self.average_gain / self.average_loss)
+
+
 def calculate(bars: Sequence[Bar]) -> FeatureTable:
-    values: list[float | None] = [None] * min(PERIOD, len(bars))
-    if len(bars) > PERIOD:
-        changes = [current.close - previous.close for previous, current in zip(bars, bars[1:])]
-        average_gain = sum(max(change, 0) for change in changes[:PERIOD]) / PERIOD
-        average_loss = sum(max(-change, 0) for change in changes[:PERIOD]) / PERIOD
-        for index in range(PERIOD, len(bars)):
-            if index > PERIOD:
-                change = changes[index - 1]
-                average_gain = (average_gain * (PERIOD - 1) + max(change, 0)) / PERIOD
-                average_loss = (average_loss * (PERIOD - 1) + max(-change, 0)) / PERIOD
-            if average_gain == average_loss == 0:
-                values.append(50.0)
-            elif average_loss == 0:
-                values.append(100.0)
-            else:
-                values.append(100 - 100 / (1 + average_gain / average_loss))
+    state = Rsi14State()
+    values = [state.add(bar.close) for bar in bars]
     return FeatureTable.from_columns((SPEC,), [bar.time for bar in bars], {SPEC.name: values})
 
 

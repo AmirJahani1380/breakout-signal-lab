@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-import pandas as pd
-
 from app.bars import Bar
 
 from . import FeatureDefinition, FeatureSpec, FeatureTable, FeatureViewSpec
@@ -11,9 +9,20 @@ from . import FeatureDefinition, FeatureSpec, FeatureTable, FeatureViewSpec
 SPEC = FeatureSpec("ema_20", "Float64", {"period": 20}, version="1")
 
 
+def ema_step(previous: float | None, current: float, period: int) -> float:
+    return (
+        current
+        if previous is None
+        else (1 - 2 / (period + 1)) * previous + 2 / (period + 1) * current
+    )
+
+
 def calculate(bars: Sequence[Bar]) -> FeatureTable:
-    closes = pd.Series([bar.close for bar in bars], dtype="Float64")
-    values = closes.ewm(span=20, adjust=False).mean().astype("Float64")
+    values: list[float] = []
+    previous: float | None = None
+    for bar in bars:
+        previous = ema_step(previous, bar.close, 20)
+        values.append(previous)
     return FeatureTable.from_columns((SPEC,), [bar.time for bar in bars], {SPEC.name: values})
 
 

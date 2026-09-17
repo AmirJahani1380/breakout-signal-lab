@@ -1,0 +1,293 @@
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pandas as pd
+import pytest
+from fastapi.testclient import TestClient
+
+from app.bars import Bar
+from app.feature_export import FeatureExportError, build_feature_frame, export_bar_features
+from app.features import FeatureDefinition, FeatureSpec, FeatureTable, discover
+from app.features.atr_20 import atr_20_values
+from app.features.ema_20 import calculate as calculate_ema
+from app.features.rsi_14 import calculate as calculate_rsi
+from app.main import Settings, create_app
+from tests.test_bars import write_csv
+
+
+def bars(count: int) -> list[Bar]:
+    return [Bar(100 + index, 10, 20, 9, 10 + index / 10, 20) for index in range(count)]
+
+
+def test_incremental_recursive_values_match_existing_calculations() -> None:
+    source = bars(100)
+    frame, _ = build_feature_frame(
+        source, "EURUSD", "H1", ["ema_20", "atr_20", "rsi_14", "rolling_overlap_20"]
+    )
+    for name, expected in (
+        ("ema_20", calculate_ema(source).frame["ema_20"]),
+        ("atr_20", pd.Series(atr_20_values(source), dtype="Float64")),
+        ("rsi_14", calculate_rsi(source).frame["rsi_14"].reset_index(drop=True)),
+    ):
+        pd.testing.assert_series_equal(
+            frame[name].reset_index(drop=True),
+            expected.reset_index(drop=True),
+            check_names=False,
+            rtol=1e-12,
+            atol=1e-12,
+        )
+    assert frame.loc[0, "rolling_overlap_20"] is pd.NA
+    assert frame.loc[20, "rolling_overlap_20"] is not pd.NA
+
+
+def test_every_builtin_feature_matches_full_history_calculation() -> None:
+    source = bars(80)
+    definitions = discover()
+    names = [spec.name for definition in definitions for spec in definition.specs]
+    frame, _ = build_feature_frame(source, "EURUSD", "H1", names, definitions)
+    for definition in definitions:
+        expected = definition.calculate(source).frame.reset_index(drop=True)
+        for name in expected.columns:
+            pd.testing.assert_series_equal(
+                frame[name].reset_index(drop=True),
+                expected[name],
+                check_names=False,
+                check_dtype=name != "volume",
+                rtol=1e-12,
+                atol=1e-12,
+            )
+
+
+def test_export_calculates_from_prior_bar_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app import feature_export
+
+    updates: list[float | None] = []
+    original_ema = feature_export._ema
+
+    def track_ema(previous: float | None, current: float, period: int) -> float:
+        if period == 20:
+            updates.append(previous)
+        return original_ema(previous, current, period)
+
+    monkeypatch.setattr(feature_export, "_ema", track_ema)
+    atr_inputs: list[float | None] = []
+    rsi_inputs: list[float | None] = []
+    macd_inputs: list[float | None] = []
+    overlap_lengths: list[int] = []
+    original_atr = feature_export.Atr20State.add
+    original_rsi = feature_export.Rsi14State.add
+    original_macd = feature_export.MacdState.add
+    original_overlap = feature_export.overlap_score
+
+    def track_atr(state: feature_export.Atr20State, bar: Bar) -> float | None:
+        atr_inputs.append(state.previous_close)
+        return original_atr(state, bar)
+
+    def track_rsi(state: feature_export.Rsi14State, close: float) -> float | None:
+        rsi_inputs.append(state.previous_close)
+        return original_rsi(state, close)
+
+    def track_overlap(window: object) -> float | None:
+        assert isinstance(window, tuple)
+        overlap_lengths.append(len(window))
+        return original_overlap(window)
+
+    def track_macd(
+        state: feature_export.MacdState, close: float, needs_signal: bool
+    ) -> tuple[float, float | None]:
+        macd_inputs.append(state.fast)
+        return original_macd(state, close, needs_signal)
+
+    monkeypatch.setattr(feature_export.Atr20State, "add", track_atr)
+    monkeypatch.setattr(feature_export.Rsi14State, "add", track_rsi)
+    monkeypatch.setattr(feature_export.MacdState, "add", track_macd)
+    monkeypatch.setattr(feature_export, "overlap_score", track_overlap)
+    build_feature_frame(
+        bars(200),
+        "EURUSD",
+        "H1",
+        ["ema_20", "macd_histogram", "atr_20", "rsi_14", "rolling_overlap_20"],
+    )
+    assert len(updates) == 200
+    assert updates[0] is None and all(value is not None for value in updates[1:])
+    assert len(atr_inputs) == len(rsi_inputs) == len(macd_inputs) == len(overlap_lengths) == 200
+    assert atr_inputs[0] is rsi_inputs[0] is None
+    assert all(value is not None for value in atr_inputs[1:] + rsi_inputs[1:])
+    assert macd_inputs[0] is None and all(value is not None for value in macd_inputs[1:])
+    assert max(overlap_lengths) == 20
+
+    def fail_overlap(_window: object) -> float:
+        raise RuntimeError("overlap broke")
+
+    monkeypatch.setattr(feature_export, "overlap_score", fail_overlap)
+    with pytest.raises(FeatureExportError, match="overlap broke"):
+        build_feature_frame(bars(21), "EURUSD", "H1", ["rolling_overlap_20"])
+
+
+def test_export_round_trips_metadata_and_refuses_overwrite(tmp_path: Path) -> None:
+    source = write_csv(
+        tmp_path / "EURUSD_H1.csv",
+        [
+            (bar.time, bar.open, max(bar.high, bar.close), bar.low, bar.close, bar.volume)
+            for bar in bars(130)
+        ],
+    )
+    frames = []
+    for format in ("csv", "parquet"):
+        output = tmp_path / format
+        table, sidecar = export_bar_features(
+            source, output, "EURUSD", "H1", ["atr_20", "volume_up", "candle_direction"], format
+        )
+        assert table.name == f"bar_features.{format}"
+        metadata = json.loads(sidecar.read_text())
+        assert metadata["dataset_id"] == "EURUSD/H1"
+        assert len(metadata["source_sha256"]) == 64
+        assert metadata["dtypes"]["volume_up"] == "boolean"
+        assert metadata["export_warm_up_rows"] == 100
+        assert [feature["name"] for feature in metadata["features"]] == [
+            "atr_20",
+            "volume_up",
+            "candle_direction",
+        ]
+        frame = (
+            pd.read_csv(table, dtype=metadata["dtypes"])
+            if format == "csv"
+            else pd.read_parquet(table)
+        )
+        assert {column: str(dtype) for column, dtype in frame.dtypes.items()} == metadata["dtypes"]
+        frames.append(frame)
+        with pytest.raises(FileExistsError):
+            export_bar_features(source, output, "EURUSD", "H1", ["atr_20"], format)
+    pd.testing.assert_frame_equal(frames[0], frames[1], rtol=1e-12, atol=1e-12)
+    assert len(frames[0]) == 30
+    assert frames[0]["atr_20"].notna().all()
+    assert frames[0]["time"].tolist() == list(range(200, 230))
+    second, _ = export_bar_features(
+        source,
+        tmp_path / "repeat",
+        "EURUSD",
+        "H1",
+        ["atr_20", "volume_up", "candle_direction"],
+        "csv",
+    )
+    assert second.read_bytes() == (tmp_path / "csv" / "bar_features.csv").read_bytes()
+
+
+def test_missing_failure_and_empty_dataset(tmp_path: Path) -> None:
+    with pytest.raises(FeatureExportError, match="unknown feature"):
+        build_feature_frame(bars(1), "EURUSD", "H1", ["missing"])
+    empty, _ = build_feature_frame([], "EURUSD", "H1", ["atr_20"])
+    assert empty.empty and list(empty.columns)[-1] == "atr_20"
+
+    spec = FeatureSpec("custom", "Float64")
+
+    def calculate_custom(source: object) -> FeatureTable:
+        assert isinstance(source, tuple)
+        return FeatureTable.from_columns((spec,), [bar.time for bar in source], {"custom": [1.25]})
+
+    definition = FeatureDefinition((spec,), calculate_custom, ())
+    frame, _ = build_feature_frame(bars(1), "EURUSD", "H1", ["custom"], (definition,))
+    assert frame.loc[0, "custom"] == 1.25
+
+    def fail(_bars: object) -> FeatureTable:
+        raise RuntimeError("calculation broke")
+
+    definition = FeatureDefinition((spec,), fail, ())
+    with pytest.raises(FeatureExportError, match="custom"):
+        build_feature_frame(bars(1), "EURUSD", "H1", ["custom"], (definition,))
+
+
+def test_api_download_contains_table_and_metadata(tmp_path: Path) -> None:
+    source_root = tmp_path / "market"
+    source_root.mkdir()
+    write_csv(source_root / "EURUSD_H1.csv", [(100, 1, 3, 0, 2, 10)])
+    with TestClient(create_app(Settings(source_root))) as client:
+        response = client.get(
+            "/api/v1/export?symbol=EURUSD&timeframe=H1&features=candle_range&format=csv"
+        )
+    assert response.status_code == 200
+    from io import BytesIO
+    from zipfile import ZipFile
+
+    with ZipFile(BytesIO(response.content)) as archive:
+        assert set(archive.namelist()) == {"bar_features.csv", "bar_features.csv.json"}
+        assert "candle_range" in archive.read("bar_features.csv").decode()
+
+
+def test_api_rejects_wrong_calculator_contract(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_root = tmp_path / "market"
+    source_root.mkdir()
+    write_csv(source_root / "EURUSD_H1.csv", [(100, 1, 3, 0, 2, 10)])
+    registered = FeatureSpec("custom_score", "Int64")
+    returned = FeatureSpec("custom_score", "Float64")
+
+    def wrong_spec(source: object) -> FeatureTable:
+        assert isinstance(source, tuple)
+        return FeatureTable.from_columns(
+            (returned,), [bar.time for bar in source], {"custom_score": [1.5]}
+        )
+
+    monkeypatch.setattr(
+        "app.main.discover", lambda: (FeatureDefinition((registered,), wrong_spec, ()),)
+    )
+    with TestClient(create_app(Settings(source_root))) as client:
+        response = client.get(
+            "/api/v1/export?symbol=EURUSD&timeframe=H1&features=custom_score&format=csv"
+        )
+    assert response.status_code == 422
+    assert "do not match the registered definition" in response.json()["detail"]
+
+
+def test_api_reports_dtype_conversion_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app import feature_export
+
+    source_root = tmp_path / "market"
+    source_root.mkdir()
+    write_csv(source_root / "EURUSD_H1.csv", [(100, 2, 3, 0, 1, 10)])
+    original_add = feature_export._BarFeatureState.add
+
+    def invalid_value(
+        state: feature_export._BarFeatureState, bar: Bar, selected: frozenset[str]
+    ) -> dict[str, object]:
+        values = original_add(state, bar, selected)
+        values["candle_direction"] = "invalid"
+        return values
+
+    monkeypatch.setattr(feature_export._BarFeatureState, "add", invalid_value)
+    with TestClient(create_app(Settings(source_root))) as client:
+        response = client.get(
+            "/api/v1/export?symbol=EURUSD&timeframe=H1&features=candle_direction&format=csv"
+        )
+    assert response.status_code == 422
+    assert "cannot convert selected feature values" in response.json()["detail"]
+
+
+def test_supplied_builtin_name_cannot_mislabel_calculation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source_root = tmp_path / "market"
+    source_root.mkdir()
+    write_csv(source_root / "EURUSD_H1.csv", [(100, 1, 3, 0, 2, 10)])
+    conflicting = FeatureSpec("ema_20", "Float64", {"period": 50}, version="2")
+
+    def custom_calculate(source: object) -> FeatureTable:
+        raise AssertionError("conflicting calculator must not run")
+
+    definition = FeatureDefinition((conflicting,), custom_calculate, ())
+    with pytest.raises(FeatureExportError, match="does not match the bundled"):
+        build_feature_frame(bars(1), "EURUSD", "H1", ["ema_20"], (definition,))
+    monkeypatch.setattr("app.main.discover", lambda: (definition,))
+    with TestClient(create_app(Settings(source_root))) as client:
+        response = client.get(
+            "/api/v1/export?symbol=EURUSD&timeframe=H1&features=ema_20&format=csv"
+        )
+    assert response.status_code == 422
+    assert "does not match the bundled" in response.json()["detail"]

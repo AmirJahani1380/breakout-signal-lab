@@ -15,7 +15,7 @@ import pandas as pd
 
 from app.bars import Bar
 
-from .view_validation import validate_view_metadata
+from .view_validation import COLOR_PATTERN, validate_view_metadata
 
 logger = logging.getLogger(__name__)
 NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
@@ -153,6 +153,7 @@ class FeatureViewSpec:
     scale_range: tuple[float, float] | None = None
     reference_lines: tuple[Mapping[str, object], ...] = ()
     color_feature: str | None = None
+    color_palette: tuple[str, str] = ("#00d08499", "#ff4d6d99")
 
     @property
     def visualization(self) -> str:
@@ -203,6 +204,11 @@ class FeatureViewSpec:
             raise ValueError(
                 "color_feature must contain lowercase letters, numbers, or underscores"
             )
+        if len(self.color_palette) != 2 or any(
+            not isinstance(color, str) or not COLOR_PATTERN.fullmatch(color)
+            for color in self.color_palette
+        ):
+            raise ValueError("color_palette must contain two hex colors")
         validate_view_metadata(
             self.renderer,
             self.series_options,
@@ -245,7 +251,7 @@ class FeatureViewSpec:
                 if self.color_feature is not None:
                     color_value = table.frame.at[timestamp, self.color_feature]
                     if not pd.isna(color_value):
-                        point["color"] = "#00d08499" if bool(color_value) else "#ff4d6d99"
+                        point["color"] = self.color_palette[0 if bool(color_value) else 1]
                 points.append(point)
         series_types = {"line": "LineSeries", "histogram": "HistogramSeries"}
         series_type = series_types[self.renderer] if self.renderer in series_types else None
@@ -386,8 +392,6 @@ def _validate_definition(value: object) -> FeatureDefinition:
         raise ValueError("feature definition names must be unique")
     if not callable(value.calculate):
         raise ValueError("calculate must be callable")
-    if not value.views:
-        raise ValueError("feature definition must contain views")
     if len({view.identifier for view in value.views}) != len(value.views):
         raise ValueError("feature definition view identifiers must be unique")
     for view in value.views:

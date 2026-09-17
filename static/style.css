@@ -76,6 +76,17 @@ header {
 .indicator button:disabled {
   opacity: 0.45;
 }
+#export-features {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  max-height: 280px;
+  overflow: auto;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+#export-panel button {
+  margin-right: 8px;
+}
 h1 {
   font-size: 18px;
   margin: 0;

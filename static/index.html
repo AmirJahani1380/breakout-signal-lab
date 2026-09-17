@@ -29,6 +29,15 @@
         >
           Indicators
         </button>
+        <button
+          id="export-tab"
+          type="button"
+          role="tab"
+          aria-selected="false"
+          aria-controls="export-panel"
+        >
+          Export
+        </button>
       </nav>
       <section
         id="indicators-panel"
@@ -37,6 +46,19 @@
         aria-labelledby="indicators-tab"
         hidden
       ></section>
+      <section
+        id="export-panel"
+        class="indicators-panel"
+        role="tabpanel"
+        aria-labelledby="export-tab"
+        hidden
+      >
+        <p>Select feature columns to export for the entire selected dataset.</p>
+        <div id="export-features"></div>
+        <button id="export-csv" type="button">Download CSV</button>
+        <button id="export-parquet" type="button">Download Parquet</button>
+        <p id="export-status" role="status"></p>
+      </section>
       <section id="chart" aria-label="Candlestick chart"></section>
       <p id="state" role="status">Loading chart…</p>
       <p class="attribution">

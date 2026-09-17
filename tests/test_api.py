@@ -232,20 +232,32 @@ def test_bars_include_backend_calculated_indicators(tmp_path: Path) -> None:
     for payload in (latest, earlier):
         definitions = {entry["id"]: entry for entry in payload["indicators"]}
         assert set(definitions) == {
+            "atr_20",
+            "atr_20_pane",
+            "atr_20_to_close",
             "body_size",
+            "body_size_to_atr_20",
+            "body_size_to_close",
             "body_to_range_ratio",
             "candle_direction",
             "candle_range",
+            "candle_range_to_atr_20",
+            "candle_range_to_close",
             "ema_20",
             "is_engulfing",
             "lower_wick_size",
+            "lower_wick_to_atr_20",
+            "lower_wick_to_close",
             "macd",
             "macd_histogram",
             "macd_signal",
             "rsi_14",
+            "rolling_overlap_20",
             "volume",
             "volume_up",
             "upper_wick_size",
+            "upper_wick_to_atr_20",
+            "upper_wick_to_close",
         }
         assert [point["value"] for point in definitions["rsi_14"]["points"]] == [100, 100]
         assert definitions["rsi_14"]["scale_range"] == [0, 100]

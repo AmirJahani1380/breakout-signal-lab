@@ -328,6 +328,20 @@ def test_indicators_tab_applies_hides_and_places_series(page: Page, viewer_url: 
     assert page.evaluate("window.__breakoutChart.panes().length") == 1
 
 
+def test_export_tab_preselects_features_and_downloads_csv(page: Page, viewer_url: str) -> None:
+    select_timeframe(page, viewer_url)
+    page.wait_for_function("document.querySelector('#chart').dataset.barCount === '1000'")
+    page.get_by_role("tab", name="Export").click()
+    panel = page.get_by_role("tabpanel", name="Export")
+    assert panel.is_visible()
+    checkboxes = panel.locator("input[type=checkbox]")
+    assert checkboxes.count() > 0
+    assert checkboxes.evaluate_all("inputs => inputs.every(input => input.checked)")
+    with page.expect_download() as downloaded:
+        panel.get_by_role("button", name="Download CSV").click()
+    assert downloaded.value.suggested_filename == "bar_features_csv.zip"
+
+
 def test_feature_labels_and_engulfing_candle_color_toggle(page: Page, viewer_url: str) -> None:
     select_timeframe(page, viewer_url, "M15")
     page.wait_for_function("document.querySelector('#chart').dataset.barCount === '3'")
