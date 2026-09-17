@@ -1,88 +1,14 @@
 from __future__ import annotations
 
 import json
-import os
-import socket
-import subprocess
-import sys
-import time
-from collections.abc import Iterator
+from io import StringIO
 from pathlib import Path
 
-import httpx
+import pandas as pd
 import pytest
-from playwright.sync_api import Page, sync_playwright
+from playwright.sync_api import Page
 
-from tests.test_bars import write_workbook
-
-
-def free_port() -> int:
-    with socket.socket() as socket_handle:
-        socket_handle.bind(("127.0.0.1", 0))
-        return int(socket_handle.getsockname()[1])
-
-
-@pytest.fixture(scope="module")
-def viewer_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
-    root = tmp_path_factory.mktemp("browser") / "market"
-    root.mkdir()
-    write_workbook(
-        root / "EURUSD_H1_max_bars.xlsx",
-        [
-            (
-                1_735_689_600 + index * 60,
-                1,
-                3,
-                0,
-                1.5 + (index % 20) / 20,
-                10,
-            )
-            for index in range(1_200)
-        ],
-    )
-    write_workbook(
-        root / "EURUSD_M15_max_bars.xlsx",
-        [
-            (1_735_689_600, 2, 3, 0, 1, 5),
-            (1_735_690_500, 1.5, 4, 1, 3.5, 5),
-            (1_735_691_400, 3, 4, 2, 3.2, 5),
-        ],
-    )
-    port = free_port()
-    process = subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "app.main:app", "--port", str(port)],
-        env={**os.environ, "BARS_DATA_ROOT": str(root)},
-    )
-    url = f"http://127.0.0.1:{port}"
-    try:
-        for _ in range(50):
-            try:
-                if httpx.get(f"{url}/api/v1/catalog", timeout=0.2).is_success:
-                    break
-            except httpx.HTTPError:
-                time.sleep(0.1)
-        else:
-            raise RuntimeError("FastAPI server did not start")
-        yield url
-    finally:
-        process.terminate()
-        process.wait(timeout=5)
-
-
-@pytest.fixture
-def page(tmp_path: Path) -> Iterator[Page]:
-    asset = Path("node_modules/lightweight-charts/dist/lightweight-charts.standalone.production.js")
-    if not asset.is_file():
-        pytest.skip("run npm ci before browser smoke tests")
-    with sync_playwright() as playwright:
-        browser = playwright.chromium.launch()
-        browser_page = browser.new_page(viewport={"width": 1200, "height": 800})
-        browser_page.route(
-            "**/lightweight-charts@5.2.0/**", lambda route: route.fulfill(path=asset)
-        )
-        yield browser_page
-        browser.close()
-
+from tests.browser_fixtures import page, viewer_url  # noqa: F401
 
 def test_symbol_then_timeframe_loads_only_the_selected_chart(page: Page, viewer_url: str) -> None:
     page.goto(viewer_url)
@@ -95,6 +21,265 @@ def test_symbol_then_timeframe_loads_only_the_selected_chart(page: Page, viewer_
     page.get_by_role("button", name="M15").click()
     page.wait_for_function("document.querySelector('#chart').dataset.barCount === '3'")
     assert page.get_by_role("button", name="M15").get_attribute("aria-pressed") == "true"
+
+
+def test_stored_export_chart_and_inspector(page: Page, viewer_url: str) -> None:
+    page.goto(viewer_url)
+    page.locator("#data-mode").select_option("stored")
+    page.locator("#symbol").select_option("XAUUSDzero")
+    page.get_by_role("button", name="D1").click()
+    page.wait_for_function("document.querySelector('#chart').dataset.barCount === '3'")
+    assert (
+        page.evaluate("window.__breakoutChart.panes()[0].getSeries()[0].data()[1].close") == 1525.7
+    )
+    assert "Stored data" in page.locator("#dataset-version").inner_text()
+    assert "research_score:v7" in page.locator("#dataset-version").inner_text()
+    page.locator("#inspect-time").select_option("1306195200")
+    assert "research_score (v7): missing" in page.locator("#inspect-values").inner_text()
+    page.locator("#inspect-time").select_option("1306281600")
+    assert "research_score (v7): 0" in page.locator("#inspect-values").inner_text()
+    page.get_by_role("tab", name="Indicators").click()
+    page.locator('[data-indicator="ema_20"] [data-apply]').check()
+    assert "ema_20 (v1): 1505.6017645079428" in page.locator("#inspect-values").inner_text()
+    assert (
+        page.evaluate("window.__breakoutChart.panes()[0].getSeries()[1].data()[1].value")
+        == 1505.6017645079428
+    )
+    assert page.locator("#chart").get_attribute("data-bar-count") == "3"
+
+
+def test_stored_paging_visibility_and_selection_preserve_values(
+    page: Page, viewer_url: str
+) -> None:
+    page.goto(viewer_url)
+    original_export_count = page.locator("#export-features input").count()
+    page.locator("#data-mode").select_option("stored")
+    assert page.locator("#export-tab").is_disabled()
+    page.locator("#symbol").select_option("XAUUSDzero")
+    page.get_by_role("button", name="H1").click()
+    page.wait_for_function("document.querySelector('#chart').dataset.barCount === '1000'")
+    latest_time = str(1_500_000_000 + 1001 * 3600)
+    page.locator("#inspect-time").select_option(latest_time)
+    assert "research_score (v7): 1001" in page.locator("#inspect-values").inner_text()
+    page.evaluate("window.__breakoutChart.timeScale().setVisibleLogicalRange({from: 0, to: 20})")
+    page.wait_for_function("document.querySelector('#chart').dataset.barCount === '1002'")
+    assert "research_score (v7): 1001" in page.locator("#inspect-values").inner_text()
+    page.locator("#inspect-time").select_option("1500000000")
+    assert "research_score (v7): missing" in page.locator("#inspect-values").inner_text()
+    page.get_by_role("tab", name="Indicators").click()
+    ema = page.locator('[data-indicator="ema_20"]')
+    ema.locator("[data-apply]").check()
+    ema.get_by_role("button", name="Hide").click()
+    assert "ema_20 (v1): 1000" in page.locator("#inspect-values").inner_text()
+    ema.get_by_role("button", name="Show").click()
+    page.get_by_role("button", name="D1").click()
+    page.wait_for_function("document.querySelector('#chart').dataset.barCount === '3'")
+    page.get_by_role("button", name="H1").click()
+    page.wait_for_function("document.querySelector('#chart').dataset.barCount === '1000'")
+    page.locator("#inspect-time").select_option(latest_time)
+    assert "research_score (v7): 1001" in page.locator("#inspect-values").inner_text()
+    page.locator("#data-mode").select_option("source")
+    assert page.locator("#export-tab").is_enabled()
+    assert page.locator("#export-features input").count() == original_export_count
+
+
+def test_stale_stored_catalog_response_cannot_replace_calculated_mode(
+    page: Page, viewer_url: str
+) -> None:
+    page.add_init_script(
+        """const originalFetch = window.fetch;
+        window.__storedCatalogResponses = [];
+        window.fetch = (input, init) => {
+            if (!String(input).includes('/api/v1/catalog?mode=stored'))
+                return originalFetch(input, init);
+            return new Promise((resolve) => window.__storedCatalogResponses.push((payload) => {
+                resolve(new Response(JSON.stringify(payload), {
+                    headers: {'Content-Type': 'application/json'}
+                }));
+            }));
+        };"""
+    )
+    page.goto(viewer_url)
+    page.wait_for_function("document.querySelector('#symbol option[value=EURUSD]') !== null")
+    page.locator("#data-mode").select_option("stored")
+    page.wait_for_function("window.__storedCatalogResponses.length === 1")
+    page.locator("#data-mode").select_option("source")
+    page.wait_for_function("!document.querySelector('#symbol').disabled")
+    page.evaluate(
+        """async payload => {
+            window.__storedCatalogResponses[0](payload);
+            await new Promise(resolve => setTimeout(resolve, 0));
+        }""",
+        {"symbols": [{"symbol": "STALE", "timeframes": ["D1"]}]},
+    )
+    assert page.locator("#data-mode").input_value() == "source"
+    assert page.locator("#symbol option[value='EURUSD']").count() == 1
+    assert page.locator("#symbol option[value='STALE']").count() == 0
+
+
+def test_native_multi_file_import_groups_and_charts_selected_exports(
+    page: Page, viewer_url: str, tmp_path: Path
+) -> None:
+    source = (Path(__file__).parent / "fixtures" / "stored_export.csv").read_text()
+    metadata = json.loads(
+        (Path(__file__).parent / "fixtures" / "stored_export.csv.json").read_text()
+    )
+    files: list[str] = []
+    for asset, timeframe, name in (("XAUUSDzero", "M5", "gold"), ("BRENT", "H1", "oil")):
+        suffix = "parquet" if name == "oil" else "csv"
+        table = tmp_path / f"{name}.{suffix}"
+        export_text = source.replace("XAUUSDzero", asset).replace(",D1,", f",{timeframe},")
+        if suffix == "csv":
+            table.write_text(export_text)
+        else:
+            frame = pd.read_csv(StringIO(export_text), float_precision="round_trip")
+            for feature in ("ema_20", "atr_20", "research_score"):
+                frame[feature] = frame[feature].astype("Float64")
+            frame.to_parquet(table, index=False)
+        sidecar = {
+            **metadata,
+            "asset": asset,
+            "timeframe": timeframe,
+            "dataset_id": f"{asset}/{timeframe}",
+        }
+        companion = tmp_path / f"{name}.{suffix}.json"
+        companion.write_text(json.dumps(sidecar))
+        files.extend((str(table), str(companion)))
+    bad = tmp_path / "missing_sidecar.csv"
+    bad.write_text(source)
+    files.append(str(bad))
+    page.goto(viewer_url)
+    page.locator("#data-mode").select_option("stored")
+    picker = page.locator("#stored-files")
+    assert picker.get_attribute("type") == "file"
+    assert picker.get_attribute("multiple") is not None
+    assert picker.get_attribute("accept") == ".csv,.parquet,.json"
+    picker.set_input_files(files)
+    page.get_by_text("Import finished. Choose a symbol and timeframe below.").wait_for()
+    results = page.locator("#stored-import-results").inner_text()
+    assert "gold.csv: imported XAUUSDzero/M5" in results
+    assert "oil.parquet: imported BRENT/H1" in results
+    assert "missing_sidecar.csv: missing missing_sidecar.csv.json" in results
+    page.wait_for_function("document.querySelector('#symbol option[value=BRENT]') !== null")
+    page.locator("#symbol").select_option("XAUUSDzero")
+    assert page.get_by_role("button", name="M5").is_visible()
+    session = page.evaluate("sessionStorage.getItem('storedImportSession')")
+    page.reload()
+    assert page.evaluate("sessionStorage.getItem('storedImportSession')") == session
+    page.locator("#data-mode").select_option("stored")
+    page.locator("#symbol").select_option("XAUUSDzero")
+    page.get_by_role("button", name="M5").click()
+    page.wait_for_function("document.querySelector('#chart').dataset.barCount === '3'")
+    assert "XAUUSDzero/M5" in page.locator("#dataset-version").inner_text()
+    page.locator("#inspect-time").select_option("1306281600")
+    assert "research_score (v7): 0" in page.locator("#inspect-values").inner_text()
+    page.locator("#inspect-time").select_option("1306195200")
+    assert "research_score (v7): missing" in page.locator("#inspect-values").inner_text()
+    assert "ema_20 (v1): 1503.4861607719367" in page.locator("#inspect-values").inner_text()
+    page.locator("#symbol").select_option("BRENT")
+    assert page.get_by_role("button", name="H1").is_visible()
+    assert page.get_by_role("button", name="M5").count() == 0
+    page.get_by_role("button", name="H1").click()
+    page.wait_for_function("document.querySelector('#chart').dataset.barCount === '3'")
+    assert "BRENT/H1" in page.locator("#dataset-version").inner_text()
+    assert (
+        page.evaluate("window.__breakoutChart.panes()[0].getSeries()[0].data()[1].close") == 1525.7
+    )
+    page.locator("#inspect-time").select_option("1306281600")
+    assert "research_score (v7): 0" in page.locator("#inspect-values").inner_text()
+    assert "ema_20 (v1): 1505.6017645079428" in page.locator("#inspect-values").inner_text()
+
+
+def test_overlapping_picker_change_cannot_replace_active_batch(page: Page, viewer_url: str) -> None:
+    page.add_init_script(
+        """const originalFetch = window.fetch;
+        window.__pendingImports = [];
+        window.fetch = (input, init) => {
+            if (String(input).includes('/api/v1/stored/import'))
+                return new Promise((resolve, reject) =>
+                    window.__pendingImports.push(() =>
+                        originalFetch(input, init).then(resolve, reject)));
+            return originalFetch(input, init);
+        };"""
+    )
+    page.goto(viewer_url)
+    page.locator("#data-mode").select_option("stored")
+    fixture = Path(__file__).parent / "fixtures"
+    picker = page.locator("#stored-files")
+    picker.set_input_files(
+        [str(fixture / "stored_export.csv"), str(fixture / "stored_export.csv.json")]
+    )
+    page.wait_for_function("window.__pendingImports.length === 1")
+    assert picker.is_disabled()
+    page.evaluate(
+        """() => {
+            const input = document.querySelector('#stored-files');
+            const transfer = new DataTransfer();
+            transfer.items.add(new File(['bad'], 'second.csv', {type: 'text/csv'}));
+            input.files = transfer.files;
+            input.dispatchEvent(new Event('change', {bubbles: true}));
+        }"""
+    )
+    assert page.evaluate("window.__pendingImports.length") == 1
+    page.evaluate("window.__pendingImports[0]()")
+    page.get_by_text("Import finished. Choose a symbol and timeframe below.").wait_for()
+    results = page.locator("#stored-import-results").inner_text()
+    assert "stored_export.csv: imported XAUUSDzero/D1" in results
+    assert "second.csv" not in results
+    assert picker.is_enabled()
+
+
+def test_second_import_clears_previous_stored_selection(
+    page: Page, viewer_url: str, tmp_path: Path
+) -> None:
+    fixture = Path(__file__).parent / "fixtures"
+    source = (fixture / "stored_export.csv").read_text()
+    metadata = json.loads((fixture / "stored_export.csv.json").read_text())
+    next_table = tmp_path / "next.csv"
+    next_table.write_text(source.replace(",D1,", ",M5,"))
+    next_sidecar = tmp_path / "next.csv.json"
+    next_sidecar.write_text(
+        json.dumps({**metadata, "timeframe": "M5", "dataset_id": "XAUUSDzero/M5"})
+    )
+    page.goto(viewer_url)
+    page.locator("#data-mode").select_option("stored")
+    picker = page.locator("#stored-files")
+    picker.set_input_files(
+        [str(fixture / "stored_export.csv"), str(fixture / "stored_export.csv.json")]
+    )
+    page.get_by_text("Import finished. Choose a symbol and timeframe below.").wait_for()
+    page.locator("#symbol").select_option("XAUUSDzero")
+    page.get_by_role("button", name="D1").click()
+    page.wait_for_function("document.querySelector('#chart').dataset.barCount === '3'")
+    assert "XAUUSDzero/D1" in page.locator("#dataset-version").inner_text()
+    picker.set_input_files([str(next_table), str(next_sidecar)])
+    page.wait_for_function(
+        "document.querySelector('#chart').dataset.barCount === '0' && "
+        "document.querySelector('#symbol').value === ''"
+    )
+    assert page.locator("#chart").is_hidden()
+    assert page.locator("#inspect-time option").count() == 0
+    assert page.locator("#inspect-values").inner_text() == ""
+    assert page.locator("#dataset-version").inner_text() == "Stored data"
+    assert page.locator("#legend").inner_text() == "Select a symbol and timeframe."
+    page.wait_for_function("!document.querySelector('#symbol').disabled")
+    page.locator("#symbol").select_option("XAUUSDzero")
+    assert page.get_by_role("button", name="M5").is_visible()
+
+
+def test_missing_stored_response_metadata_has_actionable_error(page: Page, viewer_url: str) -> None:
+    page.route(
+        "**/api/v1/bars?*",
+        lambda route: route.fulfill(json={"bars": [], "indicators": [], "has_more": False}),
+    )
+    page.goto(viewer_url)
+    page.locator("#data-mode").select_option("stored")
+    page.locator("#symbol").select_option("XAUUSDzero")
+    page.get_by_role("button", name="D1").click()
+    page.get_by_text(
+        "Unable to load bars: Stored response is missing feature metadata; "
+        "reload the export and sidecar."
+    ).wait_for()
 
 
 def select_timeframe(page: Page, viewer_url: str, timeframe: str = "H1") -> None:

@@ -16,6 +16,19 @@ const exportFeaturesElement = document.querySelector("#export-features");
 const exportStatusElement = document.querySelector("#export-status");
 const exportCsvElement = document.querySelector("#export-csv");
 const exportParquetElement = document.querySelector("#export-parquet");
+const dataModeElement = document.querySelector("#data-mode");
+const datasetVersionElement = document.querySelector("#dataset-version");
+const valueInspectorElement = document.querySelector("#value-inspector");
+const inspectTimeElement = document.querySelector("#inspect-time");
+const inspectValuesElement = document.querySelector("#inspect-values");
+const storedImportElement = document.querySelector("#stored-import");
+const storedFilesElement = document.querySelector("#stored-files");
+const storedImportStatusElement = document.querySelector(
+  "#stored-import-status",
+);
+const storedImportResultsElement = document.querySelector(
+  "#stored-import-results",
+);
 if (
   !(chartElement instanceof HTMLElement) ||
   !stateElement ||
@@ -29,7 +42,16 @@ if (
   !(exportFeaturesElement instanceof HTMLElement) ||
   !(exportStatusElement instanceof HTMLElement) ||
   !(exportCsvElement instanceof HTMLButtonElement) ||
-  !(exportParquetElement instanceof HTMLButtonElement)
+  !(exportParquetElement instanceof HTMLButtonElement) ||
+  !(dataModeElement instanceof HTMLSelectElement) ||
+  !(datasetVersionElement instanceof HTMLElement) ||
+  !(valueInspectorElement instanceof HTMLElement) ||
+  !(inspectTimeElement instanceof HTMLSelectElement) ||
+  !(inspectValuesElement instanceof HTMLElement) ||
+  !(storedImportElement instanceof HTMLElement) ||
+  !(storedFilesElement instanceof HTMLInputElement) ||
+  !(storedImportStatusElement instanceof HTMLElement) ||
+  !(storedImportResultsElement instanceof HTMLElement)
 )
   throw new Error("Missing chart UI");
 const chartContainer = chartElement;
@@ -45,6 +67,37 @@ const exportFeatures = exportFeaturesElement;
 const exportStatus = exportStatusElement;
 const exportCsv = exportCsvElement;
 const exportParquet = exportParquetElement;
+const dataMode = dataModeElement;
+const datasetVersion = datasetVersionElement;
+const valueInspector = valueInspectorElement;
+const inspectTime = inspectTimeElement;
+const inspectValues = inspectValuesElement;
+const storedImport = storedImportElement;
+const storedFiles = storedFilesElement;
+const storedImportStatus = storedImportStatusElement;
+const storedImportResults = storedImportResultsElement;
+const importSession =
+  sessionStorage.getItem("storedImportSession") ?? crypto.randomUUID();
+sessionStorage.setItem("storedImportSession", importSession);
+/** @type {Record<string, Array<{time:number,value:number|string|boolean|null}>>} */
+let storedValues = {};
+/** @type {Array<{name:string,version:string}>} */
+let storedFeatures = [];
+
+function renderStoredInspector() {
+  if (dataMode.value !== "stored") return;
+  const selected = Number(inspectTime.value);
+  inspectValues.replaceChildren();
+  for (const feature of storedFeatures) {
+    const detail = storedValues[feature.name]?.find(
+      (entry) => entry.time === selected,
+    );
+    const row = document.createElement("p");
+    row.textContent = `${feature.name} (v${feature.version}): ${detail?.value == null ? "missing" : String(detail.value)}`;
+    inspectValues.append(row);
+  }
+}
+inspectTime.addEventListener("change", renderStoredInspector);
 
 const chart = LightweightCharts.createChart(chartContainer, {
   autoSize: true,
@@ -217,7 +270,8 @@ function setIndicatorApplied(identifier, applied) {
   renderIndicatorState(identifier);
   if (!applied && activeSelection)
     legend.textContent = `${activeSelection.symbol} ${activeSelection.timeframe}`;
-  if (activeSelection) void refreshIndicators(selectionVersion);
+  if (activeSelection && dataMode.value !== "stored")
+    void refreshIndicators(selectionVersion);
   redraw();
 }
 
@@ -357,6 +411,7 @@ function addEnabledFeatures(url) {
 
 /** @param {number} version */
 async function refreshIndicators(version) {
+  if (dataMode.value === "stored") return;
   if (!activeSelection || version !== selectionVersion || !loadedBefores.length)
     return;
   const refreshVersion = ++featureRefreshVersion;
@@ -454,6 +509,9 @@ async function load(before, version) {
   if (before === null) setInitialState("Loading chart…");
   try {
     const url = new URL("/api/v1/bars", window.location.origin);
+    url.searchParams.set("mode", dataMode.value);
+    if (dataMode.value === "stored")
+      url.searchParams.set("import_session", importSession);
     url.searchParams.set("symbol", activeSelection.symbol);
     url.searchParams.set("timeframe", activeSelection.timeframe);
     if (before !== null) url.searchParams.set("before", String(before));
@@ -473,6 +531,32 @@ async function load(before, version) {
         : payload.bars.filter((bar) => !existingTimes.has(bar.time));
     const olderCount = before === null ? 0 : olderBars.length;
     bars = before === null ? olderBars : [...olderBars, ...bars];
+    if (dataMode.value === "stored") {
+      if (!payload.stored_metadata?.features || !payload.stored_values)
+        throw new Error(
+          "Stored response is missing feature metadata; reload the export and sidecar.",
+        );
+      storedFeatures = payload.stored_metadata.features;
+      datasetVersion.textContent = `Stored data · ${payload.stored_metadata.dataset_id} · dataset version (source SHA-256) ${payload.stored_metadata.dataset_version} · feature versions ${storedFeatures.map((feature) => `${feature.name}:v${feature.version}`).join(", ")}`;
+      for (const [name, entries] of Object.entries(payload.stored_values)) {
+        const previous = before === null ? [] : (storedValues[name] ?? []);
+        storedValues[name] = [...entries, ...previous];
+      }
+      const previousTime = inspectTime.value;
+      inspectTime.replaceChildren(
+        ...bars.map((bar) => {
+          const option = document.createElement("option");
+          option.value = String(bar.time);
+          option.textContent = new Date(bar.time * 1000).toISOString();
+          return option;
+        }),
+      );
+      if (bars.some((bar) => String(bar.time) === previousTime))
+        inspectTime.value = previousTime;
+      else if (bars.length)
+        inspectTime.value = String(bars[bars.length - 1].time);
+      renderStoredInspector();
+    }
     receiveIndicators(payload.indicators ?? [], before !== null);
     if (!loadedBefores.includes(before)) loadedBefores.push(before);
     nextBefore = payload.next_before;
@@ -535,6 +619,10 @@ function selectTimeframe(symbol, timeframe) {
   hasMore = true;
   initialized = false;
   loadedBefores = [];
+  storedValues = {};
+  datasetVersion.textContent =
+    dataMode.value === "stored" ? "Stored data" : "Calculated data";
+  valueInspector.hidden = dataMode.value !== "stored";
   legend.textContent = `${symbol} ${timeframe}`;
   redraw();
   timeframes.querySelectorAll("button").forEach((button) => {
@@ -550,6 +638,8 @@ function selectTimeframe(symbol, timeframe) {
 let catalog = [];
 
 async function loadCatalog() {
+  const requestVersion = selectionVersion;
+  const requestedMode = dataMode.value;
   setInitialState("Loading available symbols…");
   try {
     const featureResponse = await fetch("/api/v1/features");
@@ -559,7 +649,10 @@ async function loadCatalog() {
           `Server error ${featureResponse.status}`,
       );
     const featurePayload = await featureResponse.json();
+    if (requestVersion !== selectionVersion || requestedMode !== dataMode.value)
+      return;
     receiveIndicators(featurePayload.indicators ?? [], false);
+    exportFeatures.replaceChildren();
     for (const feature of featurePayload.export_features ?? []) {
       const label = document.createElement("label");
       const checkbox = document.createElement("input");
@@ -569,13 +662,20 @@ async function loadCatalog() {
       label.append(checkbox, ` ${feature.name}`);
       exportFeatures.append(label);
     }
-    const response = await fetch("/api/v1/catalog");
+    const catalogUrl = new URL("/api/v1/catalog", window.location.origin);
+    catalogUrl.searchParams.set("mode", requestedMode);
+    if (requestedMode === "stored")
+      catalogUrl.searchParams.set("import_session", importSession);
+    const response = await fetch(catalogUrl);
     if (!response.ok)
       throw new Error(
         (await response.json()).detail || `Server error ${response.status}`,
       );
     const payload = await response.json();
+    if (requestVersion !== selectionVersion || requestedMode !== dataMode.value)
+      return;
     catalog = payload.symbols;
+    symbolSelect.replaceChildren(new Option("Select a symbol", ""));
     for (const entry of catalog) {
       const option = document.createElement("option");
       option.value = entry.symbol;
@@ -583,13 +683,132 @@ async function loadCatalog() {
       symbolSelect.append(option);
     }
     symbolSelect.disabled = false;
-    setInitialState("Select a symbol and timeframe.");
+    setInitialState(
+      requestedMode === "stored" && !catalog.length
+        ? "Choose exports and matching metadata files to begin."
+        : "Select a symbol and timeframe.",
+    );
   } catch (error) {
+    if (requestVersion !== selectionVersion || requestedMode !== dataMode.value)
+      return;
     setInitialState(
       `Unable to load available symbols: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
 }
+
+dataMode.addEventListener("change", () => {
+  activeSelection = null;
+  selectionVersion += 1;
+  loading = false;
+  bars = [];
+  storedValues = {};
+  storedFeatures = [];
+  datasetVersion.textContent =
+    dataMode.value === "stored" ? "Stored data" : "Calculated data";
+  valueInspector.hidden = dataMode.value !== "stored";
+  storedImport.hidden = dataMode.value !== "stored";
+  exportTab.disabled = dataMode.value === "stored";
+  exportPanel.hidden = true;
+  exportTab.setAttribute("aria-selected", "false");
+  timeframes.replaceChildren();
+  symbolSelect.disabled = true;
+  void loadCatalog();
+});
+
+/** @param {File} file */
+function fileBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result).split(",", 2)[1]);
+    reader.onerror = () =>
+      reject(reader.error ?? new Error(`Cannot read ${file.name}`));
+    reader.readAsDataURL(file);
+  });
+}
+
+let importingStoredFiles = false;
+storedFiles.addEventListener("change", async () => {
+  if (importingStoredFiles) return;
+  const selected = Array.from(storedFiles.files ?? []);
+  const sidecars = new Map(
+    selected
+      .filter((file) => file.name.endsWith(".json"))
+      .map((file) => [file.name, file]),
+  );
+  const tables = selected.filter((file) => /\.(csv|parquet)$/i.test(file.name));
+  storedImportResults.replaceChildren();
+  if (!tables.length) {
+    storedImportStatus.textContent =
+      "Choose at least one CSV or Parquet export with its matching .json sidecar.";
+    return;
+  }
+  importingStoredFiles = true;
+  storedFiles.disabled = true;
+  try {
+    storedImportStatus.textContent = `Importing ${tables.length} export${tables.length === 1 ? "" : "s"}…`;
+    let importedCount = 0;
+    for (const table of tables) {
+      const result = document.createElement("li");
+      const sidecar = sidecars.get(`${table.name}.json`);
+      if (!sidecar) {
+        result.textContent = `${table.name}: missing ${table.name}.json metadata. Select both files together.`;
+      } else {
+        try {
+          const response = await fetch("/api/v1/stored/import", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              session_id: importSession,
+              filename: table.name,
+              content_base64: await fileBase64(table),
+              metadata_json: await sidecar.text(),
+            }),
+          });
+          if (!response.ok)
+            throw new Error(
+              (await response.json()).detail ??
+                `Server error ${response.status}`,
+            );
+          const imported = await response.json();
+          importedCount += 1;
+          result.textContent = `${table.name}: imported ${imported.dataset_id} (${imported.rows} bars).`;
+        } catch (error) {
+          result.textContent = `${table.name}: ${error instanceof Error ? error.message : String(error)}`;
+        }
+      }
+      storedImportResults.append(result);
+    }
+    storedImportStatus.textContent = importedCount
+      ? "Import finished. Choose a symbol and timeframe below."
+      : "No exports imported. Review the file errors above.";
+    if (importedCount && dataMode.value === "stored") {
+      activeSelection = null;
+      selectionVersion += 1;
+      loading = false;
+      bars = [];
+      nextBefore = null;
+      hasMore = true;
+      initialized = false;
+      loadedBefores = [];
+      storedValues = {};
+      storedFeatures = [];
+      inspectTime.replaceChildren();
+      inspectValues.replaceChildren();
+      datasetVersion.textContent = "Stored data";
+      legend.textContent = "Select a symbol and timeframe.";
+      symbolSelect.value = "";
+      timeframes.replaceChildren();
+      receiveIndicators([], false);
+      redraw();
+      void loadCatalog();
+    }
+  } finally {
+    storedFiles.value = "";
+    storedFiles.disabled = false;
+    importingStoredFiles = false;
+  }
+});
 
 symbolSelect.addEventListener("change", () => {
   activeSelection = null;
@@ -621,6 +840,7 @@ exportTab.addEventListener("click", () => {
 
 /** @param {"csv"|"parquet"} format */
 async function downloadFeatures(format) {
+  if (dataMode.value === "stored") return;
   if (!activeSelection) {
     exportStatus.textContent = "Select a dataset first.";
     return;

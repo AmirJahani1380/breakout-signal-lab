@@ -1,0 +1,14 @@
+{
+  "dataset_id": "XAUUSDzero/D1",
+  "asset": "XAUUSDzero",
+  "timeframe": "D1",
+  "source_sha256": "473808c54e9cb2cdfc292524e59f94414f6aeb1b3fa2d1e9e802f3f19e0a7a89",
+  "timestamp": "time: UTC Unix seconds, int64",
+  "row_key": ["dataset_id", "time"],
+  "features": [
+    {"name": "ema_20", "dtype": "Float64", "version": "1", "warm_up": 0},
+    {"name": "atr_20", "dtype": "Float64", "version": "1", "warm_up": 19},
+    {"name": "research_score", "dtype": "Float64", "version": "7", "warm_up": 0}
+  ],
+  "dtypes": {"asset": "string", "timeframe": "string", "time": "int64", "open": "float64", "high": "float64", "low": "float64", "close": "float64", "volume": "float64", "ema_20": "Float64", "atr_20": "Float64", "research_score": "Float64"}
+}

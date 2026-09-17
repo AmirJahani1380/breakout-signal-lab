@@ -13,11 +13,36 @@
         <p id="legend">Loading chart…</p>
       </header>
       <section class="selectors" aria-label="Dataset selection">
+        <label for="data-mode">Chart mode</label>
+        <select id="data-mode">
+          <option value="source">Calculated</option>
+          <option value="stored">Stored data</option>
+        </select>
         <label for="symbol">Symbol</label>
         <select id="symbol" disabled>
           <option value="">Select a symbol</option>
         </select>
         <div id="timeframes" aria-label="Available timeframes"></div>
+      </section>
+      <section id="stored-import" aria-label="Import stored exports" hidden>
+        <label for="stored-files"
+          >Choose CSV or Parquet exports and matching JSON metadata</label
+        >
+        <input
+          id="stored-files"
+          type="file"
+          accept=".csv,.parquet,.json"
+          multiple
+        />
+        <p id="stored-import-status" role="status"></p>
+        <ul id="stored-import-results"></ul>
+      </section>
+      <p id="dataset-version" role="status"></p>
+      <section id="value-inspector" aria-label="Stored value inspector" hidden>
+        <h2>Stored values</h2>
+        <label for="inspect-time">Bar timestamp</label>
+        <select id="inspect-time"></select>
+        <div id="inspect-values"></div>
       </section>
       <nav class="chart-tabs" aria-label="Chart tools">
         <button
