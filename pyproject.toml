@@ -13,7 +13,7 @@ dependencies = [
 ]
 
 [tool.setuptools]
-packages = ["app", "app.features"]
+packages = ["app", "app.features", "app.event_detectors"]
 
 [project.optional-dependencies]
 dev = [

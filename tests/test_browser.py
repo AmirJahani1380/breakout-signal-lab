@@ -11,6 +11,28 @@ import pytest
 from playwright.sync_api import Page
 
 
+def test_event_chart_overlay_matches_api_record(page: Page, viewer_url: str) -> None:
+    page.goto(viewer_url)
+    page.locator("#symbol").select_option("EURUSD")
+    page.get_by_role("button", name="H1").click()
+    page.wait_for_function("document.querySelector('#chart').dataset.barCount === '1000'")
+    page.get_by_role("tab", name="Events").click()
+    first = page.locator("#event-list button").first
+    first.wait_for()
+    identifier = first.get_attribute("data-event-id")
+    first.click()
+    records = page.request.get(f"{viewer_url}/api/v1/events?symbol=EURUSD&timeframe=H1").json()[
+        "events"
+    ]
+    record = next(event for event in records if event["id"] == identifier)
+    assert page.locator("#chart").get_attribute("data-selected-event-id") == identifier
+    assert (
+        float(page.locator("#chart").get_attribute("data-selected-broken-level"))
+        == record["broken_level"]
+    )
+    assert str(record["setup_id"]) in page.locator("#event-details").inner_text()
+
+
 def test_symbol_then_timeframe_loads_only_the_selected_chart(page: Page, viewer_url: str) -> None:
     page.goto(viewer_url)
     page.locator("#symbol").select_option("EURUSD")

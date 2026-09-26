@@ -16,6 +16,45 @@ const exportFeaturesElement = document.querySelector("#export-features");
 const exportStatusElement = document.querySelector("#export-status");
 const exportCsvElement = document.querySelector("#export-csv");
 const exportParquetElement = document.querySelector("#export-parquet");
+const eventsTab = /** @type {HTMLButtonElement} */ (
+  document.querySelector("#events-tab")
+);
+const eventsPanel = /** @type {HTMLElement} */ (
+  document.querySelector("#events-panel")
+);
+const eventDetectors = /** @type {HTMLElement} */ (
+  document.querySelector("#event-detectors")
+);
+const eventDetails = /** @type {HTMLElement} */ (
+  document.querySelector("#event-details")
+);
+const eventList = /** @type {HTMLElement} */ (
+  document.querySelector("#event-list")
+);
+const exportEventDetectors = /** @type {HTMLElement} */ (
+  document.querySelector("#export-event-detectors")
+);
+const swingLeft = /** @type {HTMLInputElement} */ (
+  document.querySelector("#swing-left")
+);
+const swingRight = /** @type {HTMLInputElement} */ (
+  document.querySelector("#swing-right")
+);
+const eventBuffer = /** @type {HTMLInputElement} */ (
+  document.querySelector("#event-buffer")
+);
+const previousEvent = /** @type {HTMLButtonElement} */ (
+  document.querySelector("#previous-event")
+);
+const nextEvent = /** @type {HTMLButtonElement} */ (
+  document.querySelector("#next-event")
+);
+const exportEventsCsv = /** @type {HTMLButtonElement} */ (
+  document.querySelector("#export-events-csv")
+);
+const exportEventsParquet = /** @type {HTMLButtonElement} */ (
+  document.querySelector("#export-events-parquet")
+);
 const dataModeElement = document.querySelector("#data-mode");
 const datasetVersionElement = document.querySelector("#dataset-version");
 const valueInspectorElement = document.querySelector("#value-inspector");
@@ -117,6 +156,136 @@ const candles = chart.addSeries(LightweightCharts.CandlestickSeries, {
   wickUpColor: "#26a69a",
   wickDownColor: "#ef5350",
 });
+/** @typedef {{id:string,detector:string,configuration:Record<string, number>,direction:string,setup_id:string,signal_time:number,availability_time:number,broken_level:number,breakout_price:number,reason:string}} BreakoutEvent */
+/** @type {BreakoutEvent[]} */
+let breakoutEvents = [];
+/** @type {Array<{direction:string,pivot_time:number,availability_time:number,level:number}>} */
+let confirmedSwings = [];
+/** @type {string | null} */
+let selectedEventId = null;
+/** @type {any} */
+let selectedLevelLine = null;
+const breakoutMarkers = LightweightCharts.createSeriesMarkers(candles, []);
+
+function selectedDetectorIds() {
+  return Array.from(
+    eventDetectors.querySelectorAll("input:checked"),
+    (input) => /** @type {HTMLInputElement} */ (input).value,
+  );
+}
+
+/** @param {URL} url */
+function addEventSettings(url) {
+  url.searchParams.set("detectors", selectedDetectorIds().join(","));
+  url.searchParams.set("swing_left", swingLeft.value);
+  url.searchParams.set("swing_right", swingRight.value);
+  url.searchParams.set("buffer", eventBuffer.value);
+}
+
+function renderEventMarkers() {
+  const visibleTimes = new Set(bars.map((bar) => bar.time));
+  const markers = [
+    ...confirmedSwings
+      .filter((swing) => visibleTimes.has(swing.pivot_time))
+      .map((swing) => ({
+        time: swing.pivot_time,
+        position: "atPriceMiddle",
+        price: swing.level,
+        shape: "circle",
+        color: "#ef5350",
+        size: 1,
+        text: `Confirmed ${swing.direction}`,
+      })),
+    ...breakoutEvents
+      .filter(
+        (event) =>
+          visibleTimes.has(event.signal_time) &&
+          selectedDetectorIds().includes(event.detector),
+      )
+      .map((event) => ({
+        time: event.signal_time,
+        position:
+          event.direction === "bullish" ? "atPriceBottom" : "atPriceTop",
+        price: event.breakout_price,
+        shape: event.direction === "bullish" ? "arrowUp" : "arrowDown",
+        color: event.direction === "bullish" ? "#26a69a" : "#ef5350",
+        text: String(event.breakout_price),
+      })),
+  ].sort((left, right) => left.time - right.time);
+  breakoutMarkers.setMarkers(markers);
+  chartContainer.dataset.eventMarkerCount = String(markers.length);
+}
+
+function renderEventList() {
+  const visible = breakoutEvents.filter((event) =>
+    selectedDetectorIds().includes(event.detector),
+  );
+  eventList.replaceChildren();
+  for (const event of visible) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = `${new Date(event.signal_time * 1000).toISOString()} ${event.detector} ${event.direction} ${event.breakout_price}`;
+    button.dataset.eventId = event.id;
+    button.addEventListener("click", () => selectEvent(event.id));
+    eventList.append(button);
+  }
+  const selected = visible.find((event) => event.id === selectedEventId);
+  if (selectedLevelLine) candles.removePriceLine(selectedLevelLine);
+  selectedLevelLine = null;
+  eventDetails.textContent = selected
+    ? `${selected.reason}; setup ${selected.setup_id}; broken level ${selected.broken_level}; signal ${new Date(selected.signal_time * 1000).toISOString()}; available ${new Date(selected.availability_time * 1000).toISOString()}`
+    : `${visible.length} loaded events`;
+  if (selected) {
+    selectedLevelLine = candles.createPriceLine({
+      price: selected.broken_level,
+      color: selected.direction === "bullish" ? "#26a69a" : "#ef5350",
+      lineWidth: 1,
+      axisLabelVisible: true,
+      title: selected.setup_id,
+    });
+    const index = bars.findIndex((bar) => bar.time === selected.signal_time);
+    if (index >= 0)
+      chart.timeScale().setVisibleLogicalRange({
+        from: Math.max(0, index - 25),
+        to: Math.min(bars.length - 1, index + 25),
+      });
+  }
+  chartContainer.dataset.selectedEventId = selected?.id ?? "";
+  chartContainer.dataset.selectedBrokenLevel = selected
+    ? String(selected.broken_level)
+    : "";
+  renderEventMarkers();
+}
+
+/** @param {string} identifier */
+function selectEvent(identifier) {
+  selectedEventId = identifier;
+  renderEventList();
+}
+
+/** @param {number} step */
+function navigateEvent(step) {
+  const visible = breakoutEvents.filter((event) =>
+    selectedDetectorIds().includes(event.detector),
+  );
+  if (!visible.length) return;
+  const position = visible.findIndex((event) => event.id === selectedEventId);
+  const next =
+    position < 0
+      ? step > 0
+        ? 0
+        : visible.length - 1
+      : Math.max(0, Math.min(visible.length - 1, position + step));
+  selectEvent(visible[next].id);
+}
+previousEvent.addEventListener("click", () => navigateEvent(-1));
+nextEvent.addEventListener("click", () => navigateEvent(1));
+for (const input of [swingLeft, swingRight, eventBuffer])
+  input.addEventListener("change", () => {
+    if (!input.reportValidity()) return;
+    if (activeSelection)
+      selectTimeframe(activeSelection.symbol, activeSelection.timeframe);
+  });
 
 /**
  * @typedef {{time:number, value:number, color?:string}} IndicatorPoint
@@ -506,6 +675,7 @@ function redraw() {
   chartContainer.dataset.candleColorCount = String(candleColors.size);
   updateIndicatorSeries();
   chartContainer.dataset.barCount = String(bars.length);
+  renderEventMarkers();
 }
 
 /** @param {string} message */
@@ -556,6 +726,28 @@ async function load(before, version) {
       );
     const payload = await response.json();
     if (version !== selectionVersion) return;
+    if (dataMode.value === "source") {
+      const eventsUrl = new URL("/api/v1/events", window.location.origin);
+      eventsUrl.searchParams.set("symbol", activeSelection.symbol);
+      eventsUrl.searchParams.set("timeframe", activeSelection.timeframe);
+      if (before !== null) eventsUrl.searchParams.set("before", String(before));
+      addPeriods(eventsUrl);
+      addEventSettings(eventsUrl);
+      const eventsResponse = await fetch(eventsUrl);
+      if (!eventsResponse.ok)
+        throw new Error((await eventsResponse.json()).detail);
+      const eventPayload = await eventsResponse.json();
+      if (version !== selectionVersion) return;
+      breakoutEvents =
+        before === null
+          ? eventPayload.events
+          : [...eventPayload.events, ...breakoutEvents];
+      confirmedSwings =
+        before === null
+          ? eventPayload.swings
+          : [...eventPayload.swings, ...confirmedSwings];
+      renderEventList();
+    }
     const range = chart.timeScale().getVisibleLogicalRange();
     const existingTimes = new Set(bars.map((bar) => bar.time));
     const olderBars =
@@ -647,6 +839,9 @@ function selectTimeframe(symbol, timeframe) {
   loading = false;
   activeSelection = { symbol, timeframe };
   bars = [];
+  breakoutEvents = [];
+  confirmedSwings = [];
+  selectedEventId = null;
   for (const definition of indicatorDefinitions)
     indicatorPoints.set(definition.id, []);
   nextBefore = null;
@@ -696,6 +891,45 @@ async function loadCatalog(previousStates = new Map()) {
         indicatorStates.set(definition.id, { ...previousState });
     }
     receiveIndicators(featurePayload.indicators ?? [], false);
+    const previouslyChecked = new Set(
+      Array.from(
+        eventDetectors.querySelectorAll("input:checked"),
+        (input) => /** @type {HTMLInputElement} */ (input).value,
+      ),
+    );
+    const previouslyExported = new Set(
+      Array.from(
+        exportEventDetectors.querySelectorAll("input:checked"),
+        (input) => /** @type {HTMLInputElement} */ (input).value,
+      ),
+    );
+    const hadDetectorChoices = eventDetectors.querySelector("input") !== null;
+    eventDetectors.replaceChildren();
+    exportEventDetectors.replaceChildren();
+    for (const detector of featurePayload.event_detectors ?? []) {
+      for (const container of [eventDetectors, exportEventDetectors]) {
+        const label = document.createElement("label");
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.value = detector.id;
+        checkbox.checked =
+          !hadDetectorChoices ||
+          (container === eventDetectors
+            ? previouslyChecked
+            : previouslyExported
+          ).has(detector.id);
+        if (container === eventDetectors)
+          checkbox.addEventListener("change", () => {
+            if (activeSelection)
+              selectTimeframe(
+                activeSelection.symbol,
+                activeSelection.timeframe,
+              );
+          });
+        label.append(checkbox, ` ${detector.label}`);
+        container.append(label);
+      }
+    }
     const hadExportFeatures = exportFeatures.querySelector("input") !== null;
     const selectedExportFeatures = new Set(
       Array.from(
@@ -760,6 +994,9 @@ dataMode.addEventListener("change", () => {
   selectionVersion += 1;
   loading = false;
   bars = [];
+  breakoutEvents = [];
+  confirmedSwings = [];
+  selectedEventId = null;
   storedValues = {};
   storedFeatures = [];
   datasetVersion.textContent =
@@ -767,6 +1004,9 @@ dataMode.addEventListener("change", () => {
   valueInspector.hidden = dataMode.value !== "stored";
   storedImport.hidden = dataMode.value !== "stored";
   exportTab.disabled = dataMode.value === "stored";
+  eventsTab.disabled = dataMode.value === "stored";
+  eventsPanel.hidden = true;
+  eventsTab.setAttribute("aria-selected", "false");
   exportPanel.hidden = true;
   exportTab.setAttribute("aria-selected", "false");
   timeframes.replaceChildren();
@@ -886,6 +1126,18 @@ indicatorsTab.addEventListener("click", () => {
   indicatorsTab.setAttribute("aria-selected", String(opening));
   exportPanel.hidden = true;
   exportTab.setAttribute("aria-selected", "false");
+  eventsPanel.hidden = true;
+  eventsTab.setAttribute("aria-selected", "false");
+});
+
+eventsTab.addEventListener("click", () => {
+  const opening = eventsPanel.hidden;
+  eventsPanel.hidden = !opening;
+  eventsTab.setAttribute("aria-selected", String(opening));
+  indicatorsPanel.hidden = true;
+  indicatorsTab.setAttribute("aria-selected", "false");
+  exportPanel.hidden = true;
+  exportTab.setAttribute("aria-selected", "false");
 });
 
 exportTab.addEventListener("click", () => {
@@ -894,7 +1146,58 @@ exportTab.addEventListener("click", () => {
   exportTab.setAttribute("aria-selected", String(opening));
   indicatorsPanel.hidden = true;
   indicatorsTab.setAttribute("aria-selected", "false");
+  eventsPanel.hidden = true;
+  eventsTab.setAttribute("aria-selected", "false");
 });
+
+/** @param {"csv"|"parquet"} format */
+async function downloadEvents(format) {
+  if (!activeSelection) {
+    exportStatus.textContent = "Select a dataset first.";
+    return;
+  }
+  const detectors = Array.from(
+    exportEventDetectors.querySelectorAll("input:checked"),
+    (input) => /** @type {HTMLInputElement} */ (input).value,
+  );
+  if (!detectors.length) {
+    exportStatus.textContent = "Select at least one event detector.";
+    return;
+  }
+  const features = Array.from(
+    exportFeatures.querySelectorAll("input:checked"),
+    (input) => /** @type {HTMLInputElement} */ (input).value,
+  );
+  exportStatus.textContent = "Preparing encountered events export…";
+  try {
+    const url = new URL("/api/v1/events/export", location.origin);
+    url.searchParams.set("symbol", activeSelection.symbol);
+    url.searchParams.set("timeframe", activeSelection.timeframe);
+    url.searchParams.set("detectors", detectors.join(","));
+    url.searchParams.set("features", features.join(","));
+    url.searchParams.set("format", format);
+    addPeriods(url);
+    url.searchParams.set("swing_left", swingLeft.value);
+    url.searchParams.set("swing_right", swingRight.value);
+    url.searchParams.set("buffer", eventBuffer.value);
+    const response = await fetch(url);
+    if (!response.ok) throw new Error((await response.json()).detail);
+    const address = URL.createObjectURL(await response.blob());
+    const link = document.createElement("a");
+    link.href = address;
+    link.download = `encountered_events_${format}.zip`;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(address), 1000);
+    exportStatus.textContent = "Encountered events export downloaded.";
+  } catch (error) {
+    exportStatus.textContent = `Event export failed: ${error instanceof Error ? error.message : String(error)}`;
+  }
+}
+exportEventsCsv.addEventListener("click", () => void downloadEvents("csv"));
+exportEventsParquet.addEventListener(
+  "click",
+  () => void downloadEvents("parquet"),
+);
 
 /** @param {"csv"|"parquet"} format */
 async function downloadFeatures(format) {

@@ -252,6 +252,8 @@ def test_bars_include_backend_calculated_indicators(tmp_path: Path) -> None:
             "candle_range",
             "candle_range_to_atr_20",
             "candle_range_to_close",
+            "confirmed_swing_high_3_3",
+            "confirmed_swing_low_3_3",
             "ema_20",
             "is_engulfing",
             "lower_wick_size",

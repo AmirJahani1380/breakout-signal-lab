@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Literal, cast
 from uuid import UUID
 
+import pandas as pd
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
@@ -25,7 +26,8 @@ from .bars import (
     discover_source_catalog,
     load_bars,
 )
-from .feature_export import FeatureExportError, export_bar_features
+from .event_detectors import DETECTORS, EventConfig, detect_events
+from .feature_export import FeatureExportError, build_feature_frame, export_bar_features
 from .features import (
     FeatureDefinition,
     FeatureTable,
@@ -125,7 +127,186 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "export_features": [
                 spec.as_dict() for definition in definitions for spec in definition.specs
             ],
+            "event_detectors": [
+                {"id": identifier, "label": label} for identifier, label in DETECTORS.items()
+            ],
         }
+
+    def event_configuration(request: Request) -> EventConfig:
+        def integer(name: str, default: int) -> int:
+            raw = request.query_params.get(name, str(default))
+            if not raw.isdecimal() or str(int(raw)) != raw:
+                raise ValueError(f"{name} must be an integer")
+            return int(raw)
+
+        raw_buffer = request.query_params.get("buffer", "0")
+        try:
+            return EventConfig(
+                ema_period=integer("ema_period", 20),
+                swing_left=integer("swing_left", 3),
+                swing_right=integer("swing_right", 3),
+                buffer=float(raw_buffer),
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    def selected_detectors(request: Request) -> list[str]:
+        raw = request.query_params.get("detectors")
+        names = list(DETECTORS) if raw is None else [name for name in raw.split(",") if name]
+        if len(names) != len(set(names)) or set(names) - DETECTORS.keys():
+            raise HTTPException(
+                status_code=422, detail="detectors must contain unique known identifiers"
+            )
+        return names
+
+    @app.get("/api/v1/events")
+    def events(
+        request: Request,
+        symbol: str = Query(min_length=1, max_length=100),
+        timeframe: str = Query(min_length=1, max_length=100),
+        before: int | None = None,
+        limit: int = Query(default=PAGE_SIZE, ge=1, le=PAGE_SIZE),
+    ) -> dict[str, object]:
+        source_catalog: SourceCatalog | None = app.state.catalog
+        if source_catalog is None:
+            raise HTTPException(status_code=503, detail=app.state.source_error)
+        try:
+            selection = source_catalog.selection(symbol, timeframe)
+            store = load_bars(selection.source_path, configured_settings.source_timezone)
+            config = event_configuration(request)
+            detected, swings = detect_events(
+                store.bars, config, selected_detectors(request), f"{symbol}/{timeframe}"
+            )
+            page = store.page(before, limit)
+            times = {bar.time for bar in page.display_bars}
+            return {
+                "events": [event for event in detected if event["signal_time"] in times],
+                "swings": [
+                    {
+                        "direction": swing.direction,
+                        "pivot_time": swing.pivot_time,
+                        "availability_time": swing.availability_time,
+                        "level": swing.level,
+                    }
+                    for swing in swings
+                    if swing.pivot_time in times
+                ],
+                "next_before": page.display_bars[0].time
+                if page.has_more and page.display_bars
+                else None,
+                "has_more": page.has_more,
+            }
+        except (OSError, SourceValidationError, ValueError) as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+
+    @app.get("/api/v1/events/export")
+    def export_events(
+        request: Request,
+        symbol: str = Query(min_length=1, max_length=100),
+        timeframe: str = Query(min_length=1, max_length=100),
+        features: str = "",
+        format: Literal["csv", "parquet"] = "csv",
+    ) -> Response:
+        source_catalog: SourceCatalog | None = app.state.catalog
+        if source_catalog is None:
+            raise HTTPException(status_code=503, detail=app.state.source_error)
+        try:
+            selection = source_catalog.selection(symbol, timeframe)
+            store = load_bars(selection.source_path, configured_settings.source_timezone)
+            definitions = configure_features(app.state.features, request.query_params)
+            names = [name for name in features.split(",") if name]
+            if names:
+                frame, specs = build_feature_frame(
+                    store.bars, symbol, timeframe, names, definitions
+                )
+            else:
+                frame, specs = build_feature_frame(
+                    store.bars, symbol, timeframe, ["volume"], definitions
+                )
+            detected, _ = detect_events(
+                store.bars,
+                event_configuration(request),
+                selected_detectors(request),
+                f"{symbol}/{timeframe}",
+            )
+            event_frame = pd.DataFrame.from_records(detected)
+            if event_frame.empty:
+                event_frame = pd.DataFrame(
+                    columns=[
+                        "id",
+                        "detector",
+                        "configuration",
+                        "direction",
+                        "setup_id",
+                        "signal_time",
+                        "availability_time",
+                        "broken_level",
+                        "breakout_price",
+                        "reason",
+                    ]
+                )
+            event_frame["configuration"] = event_frame["configuration"].map(
+                lambda value: (
+                    json.dumps(value, sort_keys=True) if isinstance(value, dict) else value
+                )
+            )
+            event_frame = event_frame.merge(
+                frame.drop(columns=["asset", "timeframe"]),
+                left_on="signal_time",
+                right_on="time",
+                how="left",
+                validate="many_to_one",
+            )
+            event_frame.insert(0, "asset", symbol)
+            event_frame.insert(1, "timeframe", timeframe)
+            with tempfile.TemporaryDirectory() as directory:
+                table = Path(directory) / f"encountered_events.{format}"
+                sidecar = Path(directory) / f"encountered_events.{format}.json"
+                if format == "csv":
+                    event_frame.to_csv(table, index=False, float_format="%.17g")
+                else:
+                    event_frame.to_parquet(table, index=False)
+                sidecar.write_text(
+                    json.dumps(
+                        {
+                            "schema": "encountered_events.v1",
+                            "asset": symbol,
+                            "timeframe": timeframe,
+                            "detectors": selected_detectors(request),
+                            "features": [spec.as_dict() for spec in specs if spec.name in names],
+                            "event_columns": [
+                                "id",
+                                "detector",
+                                "configuration",
+                                "direction",
+                                "setup_id",
+                                "signal_time",
+                                "availability_time",
+                                "broken_level",
+                                "breakout_price",
+                                "reason",
+                            ],
+                            "row_key": ["id"],
+                        },
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+                archive_bytes = BytesIO()
+                with zipfile.ZipFile(archive_bytes, "w", zipfile.ZIP_DEFLATED) as archive:
+                    archive.write(table, table.name)
+                    archive.write(sidecar, sidecar.name)
+                return Response(
+                    archive_bytes.getvalue(),
+                    media_type="application/zip",
+                    headers={
+                        "Content-Disposition": (
+                            f'attachment; filename="encountered_events_{format}.zip"'
+                        )
+                    },
+                )
+        except (OSError, SourceValidationError, FeatureExportError, ValueError) as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
 
     @app.post("/api/v1/stored/import")
     def import_stored(payload: StoredImport) -> dict[str, object]:

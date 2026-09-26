@@ -55,6 +55,15 @@
           Indicators
         </button>
         <button
+          id="events-tab"
+          type="button"
+          role="tab"
+          aria-selected="false"
+          aria-controls="events-panel"
+        >
+          Events
+        </button>
+        <button
           id="export-tab"
           type="button"
           role="tab"
@@ -72,6 +81,34 @@
         hidden
       ></section>
       <section
+        id="events-panel"
+        class="indicators-panel"
+        role="tabpanel"
+        aria-labelledby="events-tab"
+        hidden
+      >
+        <p>Breakout detectors</p>
+        <div id="event-detectors"></div>
+        <label
+          >Swing left bars
+          <input id="swing-left" type="number" min="1" max="100" value="3"
+        /></label>
+        <label
+          >Swing right bars
+          <input id="swing-right" type="number" min="1" max="100" value="3"
+        /></label>
+        <label
+          >Price buffer
+          <input id="event-buffer" type="number" min="0" step="any" value="0"
+        /></label>
+        <p>
+          <button id="previous-event" type="button">Previous</button>
+          <button id="next-event" type="button">Next</button>
+        </p>
+        <div id="event-details" role="status"></div>
+        <div id="event-list"></div>
+      </section>
+      <section
         id="export-panel"
         class="indicators-panel"
         role="tabpanel"
@@ -82,6 +119,17 @@
         <div id="export-features"></div>
         <button id="export-csv" type="button">Download CSV</button>
         <button id="export-parquet" type="button">Download Parquet</button>
+        <p>
+          Select event detectors and feature columns for a separate encountered
+          events export.
+        </p>
+        <div id="export-event-detectors"></div>
+        <button id="export-events-csv" type="button">
+          Download events CSV
+        </button>
+        <button id="export-events-parquet" type="button">
+          Download events Parquet
+        </button>
         <p id="export-status" role="status"></p>
       </section>
       <section id="chart" aria-label="Candlestick chart"></section>
