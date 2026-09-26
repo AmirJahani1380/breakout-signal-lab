@@ -32,6 +32,7 @@ class FeatureSpec:
     version: str = "1"
     causality: Literal["causal", "non_causal"] = "causal"
     source: Literal["computed", "imported"] = "computed"
+    selection_key: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not NAME_PATTERN.fullmatch(self.name):
@@ -46,6 +47,10 @@ class FeatureSpec:
             raise ValueError("causality must be 'causal' or 'non_causal'")
         if self.source not in ("computed", "imported"):
             raise ValueError("source must be 'computed' or 'imported'")
+        if self.selection_key is not None and not NAME_PATTERN.fullmatch(self.selection_key):
+            raise ValueError(
+                "selection_key must contain lowercase letters, numbers, or underscores"
+            )
         try:
             json.dumps(dict(self.parameters), allow_nan=False)
         except (TypeError, ValueError) as error:
@@ -61,6 +66,7 @@ class FeatureSpec:
             "version": self.version,
             "causality": self.causality,
             "source": self.source,
+            **({"selection_key": self.selection_key} if self.selection_key else {}),
         }
 
 
@@ -154,10 +160,12 @@ class FeatureViewSpec:
     reference_lines: tuple[Mapping[str, object], ...] = ()
     color_feature: str | None = None
     color_palette: tuple[str, str] = ("#00d08499", "#ff4d6d99")
+    selection_key: str | None = None
+    candle_color: str | None = None
 
     @property
     def visualization(self) -> str:
-        if self.identifier == "is_engulfing":
+        if self.candle_color is not None:
             return "candle color"
         if self.renderer is None:
             return "crosshair"
@@ -172,6 +180,12 @@ class FeatureViewSpec:
             )
         if not isinstance(self.feature_name, str) or not NAME_PATTERN.fullmatch(self.feature_name):
             raise ValueError("feature_name must contain lowercase letters, numbers, or underscores")
+        if self.selection_key is not None and not NAME_PATTERN.fullmatch(self.selection_key):
+            raise ValueError(
+                "selection_key must contain lowercase letters, numbers, or underscores"
+            )
+        if self.candle_color is not None and not COLOR_PATTERN.fullmatch(self.candle_color):
+            raise ValueError("candle_color must be a hex color")
         if (
             not isinstance(self.label, str)
             or not self.label.strip()
@@ -244,7 +258,7 @@ class FeatureViewSpec:
                 continue
             normalized = bool(value) if feature_spec.dtype == "boolean" else float(value)
             detail = {"time": int(cast(int, timestamp)), "value": normalized}
-            if self.show_in_crosshair:
+            if self.show_in_crosshair or self.candle_color is not None:
                 values.append(detail)
             if self.renderer is not None:
                 point: dict[str, object] = dict(detail)
@@ -257,6 +271,8 @@ class FeatureViewSpec:
         series_type = series_types[self.renderer] if self.renderer in series_types else None
         return {
             "id": self.identifier,
+            "selection_key": self.selection_key or self.identifier,
+            "candle_color": self.candle_color,
             "feature_name": self.feature_name,
             "source": feature_spec.source,
             "label": self.label,
@@ -285,6 +301,8 @@ class FeatureDefinition:
     views: tuple[FeatureViewSpec, ...]
     calculation_warm_up: int = 0
     calculate_selected: Callable[[Sequence[Bar], frozenset[str]], FeatureTable] | None = None
+    settings: tuple[FeatureSetting, ...] = ()
+    configure: Callable[[Mapping[str, int]], FeatureDefinition] | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -295,6 +313,43 @@ class FeatureDefinition:
             raise ValueError("calculation_warm_up must be a non-negative integer")
         if self.calculate_selected is not None and not callable(self.calculate_selected):
             raise ValueError("calculate_selected must be callable")
+        if self.settings and self.configure is None:
+            raise ValueError("configurable features must provide configure")
+
+
+@dataclass(frozen=True, slots=True)
+class FeatureSetting:
+    key: str
+    label: str
+    default: int
+    minimum: int = 1
+    maximum: int = 500
+    parameters: tuple[str, ...] = ("period",)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.key, str) or not NAME_PATTERN.fullmatch(self.key):
+            raise ValueError("setting key must contain lowercase letters, numbers, or underscores")
+        if (
+            not isinstance(self.label, str)
+            or not self.label.strip()
+            or any(type(value) is not int for value in (self.minimum, self.default, self.maximum))
+            or not 1 <= self.minimum <= self.default <= self.maximum
+        ):
+            raise ValueError(f"invalid setting {self.key!r} bounds or label")
+        if not self.parameters or any(
+            not isinstance(name, str) or not NAME_PATTERN.fullmatch(name)
+            for name in self.parameters
+        ):
+            raise ValueError(f"invalid stored parameters for {self.key!r}")
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "key": self.key,
+            "label": self.label,
+            "default": self.default,
+            "minimum": self.minimum,
+            "maximum": self.maximum,
+        }
 
 
 def discover() -> tuple[FeatureDefinition, ...]:
@@ -305,13 +360,13 @@ def discover() -> tuple[FeatureDefinition, ...]:
         if module_info.name.rsplit(".", 1)[-1] in {
             "candle_measurements",
             "comparison",
+            "configuration",
             "view_validation",
         }:
             continue
         try:
-            definition = _validate_definition(
-                getattr(importlib.import_module(module_info.name), "feature", None)
-            )
+            module = importlib.import_module(module_info.name)
+            definition = _validate_definition(getattr(module, "feature", None))
             definition_names = {spec.name for spec in definition.specs}
             definition_views = {view.identifier for view in definition.views}
             if names & definition_names:

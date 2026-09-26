@@ -14,9 +14,9 @@ from app.features import (
     calculate_requested,
     discover,
 )
-from app.features.ema_20 import feature as ema_definition
+from app.features.ema import feature as ema_definition
 from app.features.macd import feature as macd_definition
-from app.features.rsi_14 import calculate as calculate_rsi
+from app.features.rsi import calculate as calculate_rsi
 from app.features.volume import calculate as calculate_volume
 
 
@@ -76,12 +76,14 @@ def test_ema_and_macd_have_expected_named_aligned_columns() -> None:
     assert ema is not None and macd is not None
     assert list(ema.frame) == ["ema_20"]
     assert ema.frame["ema_20"].tolist() == pytest.approx([1, 1.0952380952, 1.2766439909])
-    assert list(macd.frame) == ["macd", "macd_signal", "macd_histogram"]
+    assert list(macd.frame) == ["macd_12_26_9", "macd_signal_12_26_9", "macd_histogram_12_26_9"]
     assert macd.timestamps == (100, 101, 102)
     assert macd.frame.iloc[0].tolist() == pytest.approx([0, 0, 0])
 
 
-@pytest.mark.parametrize("feature_name", ["macd", "macd_signal", "macd_histogram"])
+@pytest.mark.parametrize(
+    "feature_name", ["macd_12_26_9", "macd_signal_12_26_9", "macd_histogram_12_26_9"]
+)
 def test_grouped_calculation_returns_only_requested_output(feature_name: str) -> None:
     table = calculate_requested(macd_definition, bars([1.0, 2.0, 3.0]), frozenset({feature_name}))
 
@@ -132,6 +134,26 @@ def test_null_color_feature_omits_per_point_color() -> None:
     assert payload["points"] == [
         {"time": 1, "value": 10.0},
         {"time": 2, "value": 11.0, "color": "#00d08499"},
+    ]
+
+
+def test_candle_color_view_supplies_values_without_crosshair_details() -> None:
+    spec = FeatureSpec("signal", "boolean")
+    table = FeatureTable.from_columns((spec,), [1, 2], {"signal": [False, True]})
+    payload = FeatureViewSpec(
+        "signal",
+        "signal",
+        "Signal",
+        "Candle color",
+        None,
+        show_in_crosshair=False,
+        candle_color="#ffd600",
+    ).definition(table)
+    assert payload["visualization"] == "candle color"
+    assert payload["candle_color"] == "#ffd600"
+    assert payload["values"] == [
+        {"time": 1, "value": False},
+        {"time": 2, "value": True},
     ]
 
 

@@ -13,6 +13,7 @@ const indicatorsPanelElement = document.querySelector("#indicators-panel");
 const exportTabElement = document.querySelector("#export-tab");
 const exportPanelElement = document.querySelector("#export-panel");
 const exportFeaturesElement = document.querySelector("#export-features");
+const indicatorSettingsElement = document.querySelector("#indicator-settings");
 const exportStatusElement = document.querySelector("#export-status");
 const exportCsvElement = document.querySelector("#export-csv");
 const exportParquetElement = document.querySelector("#export-parquet");
@@ -40,6 +41,7 @@ if (
   !(exportTabElement instanceof HTMLButtonElement) ||
   !(exportPanelElement instanceof HTMLElement) ||
   !(exportFeaturesElement instanceof HTMLElement) ||
+  !(indicatorSettingsElement instanceof HTMLFieldSetElement) ||
   !(exportStatusElement instanceof HTMLElement) ||
   !(exportCsvElement instanceof HTMLButtonElement) ||
   !(exportParquetElement instanceof HTMLButtonElement) ||
@@ -64,6 +66,9 @@ const indicatorsPanel = indicatorsPanelElement;
 const exportTab = exportTabElement;
 const exportPanel = exportPanelElement;
 const exportFeatures = exportFeaturesElement;
+const indicatorSettings = indicatorSettingsElement;
+/** @type {HTMLInputElement[]} */
+let settingInputs = [];
 const exportStatus = exportStatusElement;
 const exportCsv = exportCsvElement;
 const exportParquet = exportParquetElement;
@@ -116,8 +121,9 @@ const candles = chart.addSeries(LightweightCharts.CandlestickSeries, {
 
 /**
  * @typedef {{time:number, value:number, color?:string}} IndicatorPoint
- * @typedef {{id:string, feature_name:string, source:"computed"|"imported", label:string, description:string,
- * visualization:string,
+ * @typedef {{applied:boolean, visible:boolean}} IndicatorState
+ * @typedef {{id:string, selection_key?:string, feature_name:string, source:"computed"|"imported", label:string, description:string,
+ * visualization:string, candle_color?:string|null,
  * renderer:"line"|"histogram"|"marker"|null, series_type:string|null,
  * pane:"main"|"separate", default_applied:boolean, default_visible:boolean,
  * show_in_crosshair:boolean,
@@ -129,8 +135,10 @@ const candles = chart.addSeries(LightweightCharts.CandlestickSeries, {
 
 /** @type {IndicatorDefinition[]} */
 let indicatorDefinitions = [];
-/** @type {Map<string, {applied:boolean, visible:boolean}>} */
+/** @type {Map<string, IndicatorState>} */
 const indicatorStates = new Map();
+/** @type {Map<string, IndicatorState>} */
+const pendingPeriodStates = new Map();
 /** @type {Map<string, IndicatorPoint[]>} */
 const indicatorPoints = new Map();
 /** @type {Map<string, any>} */
@@ -396,6 +404,8 @@ let loading = false;
 let initialized = false;
 /** @type {{symbol:string, timeframe:string} | null} */
 let activeSelection = null;
+/** @type {{symbol:string, timeframe:string} | null} */
+let pendingPeriodSelection = null;
 let selectionVersion = 0;
 let featureRefreshVersion = 0;
 /** @type {(number | null)[]} */
@@ -407,6 +417,38 @@ function addEnabledFeatures(url) {
     .filter(([, featureState]) => featureState.applied)
     .map(([identifier]) => identifier);
   if (indicatorStates.size) url.searchParams.set("features", enabled.join(","));
+}
+
+function addPeriods(url) {
+  for (const input of settingInputs)
+    url.searchParams.set(input.dataset.period, input.value);
+}
+
+/** @param {Array<{key:string,label:string,default:number,minimum:number,maximum:number}>} settings */
+function renderSettings(settings) {
+  const previous = new Map(
+    settingInputs.map((input) => [input.dataset.period, input.value]),
+  );
+  const legend = document.createElement("legend");
+  legend.textContent = "Indicator settings";
+  indicatorSettings.replaceChildren(legend);
+  settingInputs = [];
+  indicatorSettings.hidden = settings.length === 0;
+  for (const setting of settings) {
+    const label = document.createElement("label");
+    label.textContent = setting.label;
+    const input = document.createElement("input");
+    input.type = "number";
+    input.min = String(setting.minimum);
+    input.max = String(setting.maximum);
+    input.step = "1";
+    input.value = previous.get(setting.key) ?? String(setting.default);
+    input.dataset.period = setting.key;
+    input.addEventListener("change", onSettingChange);
+    label.append(input);
+    indicatorSettings.append(label);
+    settingInputs.push(input);
+  }
 }
 
 /** @param {number} version */
@@ -421,6 +463,7 @@ async function refreshIndicators(version) {
       const url = new URL("/api/v1/bars", window.location.origin);
       url.searchParams.set("symbol", activeSelection.symbol);
       url.searchParams.set("timeframe", activeSelection.timeframe);
+      addPeriods(url);
       if (before !== null) url.searchParams.set("before", String(before));
       addEnabledFeatures(url);
       const response = await fetch(url);
@@ -448,30 +491,26 @@ async function refreshIndicators(version) {
 }
 
 function redraw() {
-  const engulfing = indicatorDefinitions.find(
-    (definition) => definition.id === "is_engulfing",
-  );
-  const engulfingEnabled = indicatorStates.get("is_engulfing")?.applied;
-  const engulfingTimes = new Set(
-    engulfingEnabled
-      ? (engulfing?.values ?? [])
-          .filter((detail) => detail.value === true)
-          .map((detail) => detail.time)
-      : [],
-  );
+  const candleColors = new Map();
+  for (const definition of indicatorDefinitions) {
+    if (
+      !definition.candle_color ||
+      !indicatorStates.get(definition.id)?.applied
+    )
+      continue;
+    for (const detail of definition.values)
+      if (detail.value === true)
+        candleColors.set(detail.time, definition.candle_color);
+  }
   candles.setData(
-    bars.map((bar) =>
-      engulfingTimes.has(bar.time)
-        ? {
-            ...bar,
-            color: "#ffd600",
-            wickColor: "#ffd600",
-            borderColor: "#ffd600",
-          }
-        : bar,
-    ),
+    bars.map((bar) => {
+      const color = candleColors.get(bar.time);
+      return color
+        ? { ...bar, color, wickColor: color, borderColor: color }
+        : bar;
+    }),
   );
-  chartContainer.dataset.engulfingCount = String(engulfingTimes.size);
+  chartContainer.dataset.candleColorCount = String(candleColors.size);
   updateIndicatorSeries();
   chartContainer.dataset.barCount = String(bars.length);
 }
@@ -514,6 +553,7 @@ async function load(before, version) {
       url.searchParams.set("import_session", importSession);
     url.searchParams.set("symbol", activeSelection.symbol);
     url.searchParams.set("timeframe", activeSelection.timeframe);
+    addPeriods(url);
     if (before !== null) url.searchParams.set("before", String(before));
     addEnabledFeatures(url);
     const response = await fetch(url);
@@ -609,6 +649,7 @@ function selectTimeframe(symbol, timeframe) {
     activeSelection.timeframe === timeframe
   )
     return;
+  pendingPeriodSelection = null;
   selectionVersion += 1;
   loading = false;
   activeSelection = { symbol, timeframe };
@@ -637,12 +678,15 @@ function selectTimeframe(symbol, timeframe) {
 /** @type {Array<{symbol:string, timeframes:string[]}>} */
 let catalog = [];
 
-async function loadCatalog() {
+/** @param {Map<string, IndicatorState>} [previousStates] @returns {Promise<boolean>} */
+async function loadCatalog(previousStates = new Map()) {
   const requestVersion = selectionVersion;
   const requestedMode = dataMode.value;
   setInitialState("Loading available symbols…");
   try {
-    const featureResponse = await fetch("/api/v1/features");
+    const featureUrl = new URL("/api/v1/features", window.location.origin);
+    addPeriods(featureUrl);
+    const featureResponse = await fetch(featureUrl);
     if (!featureResponse.ok)
       throw new Error(
         (await featureResponse.json()).detail ||
@@ -650,15 +694,33 @@ async function loadCatalog() {
       );
     const featurePayload = await featureResponse.json();
     if (requestVersion !== selectionVersion || requestedMode !== dataMode.value)
-      return;
+      return false;
+    renderSettings(featurePayload.settings ?? []);
+    for (const definition of featurePayload.indicators ?? []) {
+      const previousState = previousStates.get(
+        definition.selection_key ?? definition.id,
+      );
+      if (previousState)
+        indicatorStates.set(definition.id, { ...previousState });
+    }
     receiveIndicators(featurePayload.indicators ?? [], false);
+    const hadExportFeatures = exportFeatures.querySelector("input") !== null;
+    const selectedExportFeatures = new Set(
+      Array.from(
+        exportFeatures.querySelectorAll("input:checked"),
+        (input) => /** @type {HTMLInputElement} */ (input).dataset.selectionKey,
+      ),
+    );
     exportFeatures.replaceChildren();
     for (const feature of featurePayload.export_features ?? []) {
       const label = document.createElement("label");
       const checkbox = document.createElement("input");
       checkbox.type = "checkbox";
       checkbox.value = feature.name;
-      checkbox.checked = true;
+      checkbox.dataset.selectionKey = feature.selection_key ?? feature.name;
+      checkbox.checked =
+        !hadExportFeatures ||
+        selectedExportFeatures.has(checkbox.dataset.selectionKey);
       label.append(checkbox, ` ${feature.name}`);
       exportFeatures.append(label);
     }
@@ -673,7 +735,7 @@ async function loadCatalog() {
       );
     const payload = await response.json();
     if (requestVersion !== selectionVersion || requestedMode !== dataMode.value)
-      return;
+      return false;
     catalog = payload.symbols;
     symbolSelect.replaceChildren(new Option("Select a symbol", ""));
     for (const entry of catalog) {
@@ -688,17 +750,21 @@ async function loadCatalog() {
         ? "Choose exports and matching metadata files to begin."
         : "Select a symbol and timeframe.",
     );
+    return true;
   } catch (error) {
     if (requestVersion !== selectionVersion || requestedMode !== dataMode.value)
-      return;
+      return false;
     setInitialState(
       `Unable to load available symbols: ${error instanceof Error ? error.message : String(error)}`,
     );
+    return false;
   }
 }
 
 dataMode.addEventListener("change", () => {
   activeSelection = null;
+  pendingPeriodSelection = null;
+  pendingPeriodStates.clear();
   selectionVersion += 1;
   loading = false;
   bars = [];
@@ -859,6 +925,7 @@ async function downloadFeatures(format) {
     url.searchParams.set("timeframe", activeSelection.timeframe);
     url.searchParams.set("features", selected.join(","));
     url.searchParams.set("format", format);
+    addPeriods(url);
     const response = await fetch(url);
     if (!response.ok) throw new Error((await response.json()).detail);
     const address = URL.createObjectURL(await response.blob());
@@ -874,6 +941,41 @@ async function downloadFeatures(format) {
 }
 exportCsv.addEventListener("click", () => void downloadFeatures("csv"));
 exportParquet.addEventListener("click", () => void downloadFeatures("parquet"));
+
+function onSettingChange() {
+  const previous = activeSelection ?? pendingPeriodSelection;
+  pendingPeriodSelection = previous;
+  /** @type {Map<string, IndicatorState>} */
+  const previousStates = new Map(pendingPeriodStates);
+  for (const [identifier, state] of indicatorStates) {
+    const definition = indicatorDefinitions.find(
+      (entry) => entry.id === identifier,
+    );
+    previousStates.set(definition?.selection_key ?? identifier, { ...state });
+  }
+  pendingPeriodStates.clear();
+  for (const [identifier, state] of previousStates)
+    pendingPeriodStates.set(identifier, { ...state });
+  for (const series of indicatorSeries.values()) chart.removeSeries(series);
+  indicatorSeries.clear();
+  for (const markers of indicatorMarkers.values()) markers.setMarkers([]);
+  indicatorMarkers.clear();
+  indicatorPoints.clear();
+  indicatorStates.clear();
+  activeSelection = null;
+  const requestVersion = ++selectionVersion;
+  loading = false;
+  void loadCatalog(previousStates).then((loaded) => {
+    if (!loaded || requestVersion !== selectionVersion) return;
+    pendingPeriodSelection = null;
+    pendingPeriodStates.clear();
+    if (previous) {
+      symbolSelect.value = previous.symbol;
+      renderTimeframes(previous.symbol);
+      selectTimeframe(previous.symbol, previous.timeframe);
+    }
+  });
+}
 
 chart.subscribeCrosshairMove(
   /** @param {any} event */ (event) => {

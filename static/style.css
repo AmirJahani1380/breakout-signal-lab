@@ -54,6 +54,11 @@ header {
   border: 1px solid #363a45;
   box-shadow: 0 4px 16px #0008;
 }
+#indicators-panel {
+  box-sizing: border-box;
+  height: 320px;
+  overflow-y: auto;
+}
 .indicator {
   display: grid;
   grid-template-columns: minmax(140px, 1fr) auto auto minmax(110px, auto);

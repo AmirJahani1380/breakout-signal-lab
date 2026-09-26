@@ -209,7 +209,14 @@ def load_stored_dataset(path: Path) -> StoredDataset:
         # Export warm-up rows have already been withheld; do not apply source-start checks again.
         view_specs = tuple(
             FeatureSpec(
-                spec.name, spec.dtype, spec.parameters, 0, spec.version, spec.causality, spec.source
+                spec.name,
+                spec.dtype,
+                spec.parameters,
+                0,
+                spec.version,
+                spec.causality,
+                spec.source,
+                spec.selection_key,
             )
             for spec in specs
         )

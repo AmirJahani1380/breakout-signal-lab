@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Literal, cast
 from uuid import UUID
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -27,6 +27,7 @@ from .bars import (
 )
 from .feature_export import FeatureExportError, export_bar_features
 from .features import FeatureDefinition, FeatureTable, calculate_requested, discover
+from .features.configuration import configure_features, configure_stored_features, settings_catalog
 from .stored_data import StoredDataError, StoredDataset, load_stored_dataset
 
 DEFAULT_DATA_ROOT = Path(
@@ -107,9 +108,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"symbols": source_catalog.symbols()}
 
     @app.get("/api/v1/features")
-    def features() -> dict[str, object]:
-        definitions: tuple[FeatureDefinition, ...] = app.state.features
+    def features(request: Request) -> dict[str, object]:
+        try:
+            definitions = configure_features(app.state.features, request.query_params)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
         return {
+            "settings": [setting.as_dict() for setting in settings_catalog(app.state.features)],
             "indicators": _empty_feature_payload(definitions),
             "export_features": [
                 spec.as_dict() for definition in definitions for spec in definition.specs
@@ -148,6 +153,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/v1/export")
     def export(
+        request: Request,
         symbol: str = Query(min_length=1, max_length=100),
         timeframe: str = Query(min_length=1, max_length=100),
         features: str = Query(min_length=1),
@@ -170,7 +176,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     names,
                     cast(Literal["csv", "parquet"], format),
                     configured_settings.source_timezone,
-                    app.state.features,
+                    configure_features(app.state.features, request.query_params),
                 )
                 archive_bytes = BytesIO()
                 with zipfile.ZipFile(archive_bytes, "w", zipfile.ZIP_DEFLATED) as archive:
@@ -183,11 +189,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         "Content-Disposition": f'attachment; filename="bar_features_{format}.zip"'
                     },
                 )
-        except (OSError, SourceValidationError, FeatureExportError) as error:
+        except (OSError, SourceValidationError, FeatureExportError, ValueError) as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
 
     @app.get("/api/v1/bars")
     def bars(
+        request: Request,
         symbol: str = Query(min_length=1, max_length=100),
         timeframe: str = Query(min_length=1, max_length=100),
         before: int | None = Query(default=None, description="Exclusive UTC Unix timestamp"),
@@ -204,14 +211,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     import_session, {}
                 )
                 dataset = imported.get((symbol, timeframe))
-                if dataset is not None:
-                    return dataset.page(before, limit, app.state.features)
-                root = configured_settings.stored_data_root
-                if root is None:
-                    raise StoredDataError("STORED_DATA_ROOT is not configured")
-                path = _stored_selection_path(root, symbol, timeframe)
-                return load_stored_dataset(path).page(before, limit, app.state.features)
-            except (OSError, StoredDataError) as error:
+                if dataset is None:
+                    root = configured_settings.stored_data_root
+                    if root is None:
+                        raise StoredDataError("STORED_DATA_ROOT is not configured")
+                    path = _stored_selection_path(root, symbol, timeframe)
+                    dataset = load_stored_dataset(path)
+                definitions = configure_stored_features(app.state.features, dataset.table.specs)
+                return dataset.page(before, limit, definitions)
+            except (OSError, StoredDataError, ValueError) as error:
                 raise HTTPException(status_code=422, detail=str(error)) from error
         source_catalog: SourceCatalog | None = app.state.catalog
         if source_catalog is None:
@@ -222,7 +230,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             selection = source_catalog.selection(symbol, timeframe)
         except (OSError, SourceValidationError) as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
-        definitions: tuple[FeatureDefinition, ...] = app.state.features
+        try:
+            definitions = configure_features(app.state.features, request.query_params)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
         views = {view.identifier: view for definition in definitions for view in definition.views}
         if features is None:
             enabled = set(views)

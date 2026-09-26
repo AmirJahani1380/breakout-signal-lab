@@ -7,8 +7,17 @@ from fastapi.testclient import TestClient
 
 from app import bars as bars_module
 from app.bars import Bar
-from app.features import FeatureDefinition, FeatureSpec, FeatureTable, FeatureViewSpec
-from app.features.ema_20 import feature as ema_definition
+from app.feature_export import export_bar_features
+from app.features import (
+    FeatureDefinition,
+    FeatureSetting,
+    FeatureSpec,
+    FeatureTable,
+    FeatureViewSpec,
+    discover,
+)
+from app.features.configuration import configure_features, configure_stored_features
+from app.features.ema import feature as ema_definition
 from app.main import Settings, create_app
 from tests.test_bars import valid, write_csv, write_workbook
 
@@ -248,9 +257,9 @@ def test_bars_include_backend_calculated_indicators(tmp_path: Path) -> None:
             "lower_wick_size",
             "lower_wick_to_atr_20",
             "lower_wick_to_close",
-            "macd",
-            "macd_histogram",
-            "macd_signal",
+            "macd_12_26_9",
+            "macd_histogram_12_26_9",
+            "macd_signal_12_26_9",
             "rsi_14",
             "rolling_overlap_20",
             "volume",
@@ -297,3 +306,326 @@ def test_non_finite_feature_is_skipped_without_breaking_valid_features(
     assert response.status_code == 200
     assert [definition["id"] for definition in response.json()["indicators"]] == ["ema_20"]
     assert "bad_score values must be finite or null" in caplog.text
+
+
+def test_period_settings_flow_to_catalog_chart_and_export(tmp_path: Path) -> None:
+    import csv
+    import json
+    from io import BytesIO
+    from zipfile import ZipFile
+
+    root = tmp_path / "market"
+    root.mkdir()
+    rows = []
+    for index in range(150):
+        close = 100 + index * 0.13 + (index % 7) * 0.8
+        open_price = close - (1 if index % 3 else -0.5)
+        rows.append(
+            (
+                100 + index,
+                open_price,
+                max(open_price, close) + 1,
+                min(open_price, close) - 1,
+                close,
+                index + 1,
+            )
+        )
+    write_csv(root / "EURUSD_H1.csv", rows)
+    settings = {
+        "atr_period": 10,
+        "rsi_period": 7,
+        "ema_period": 9,
+        "rolling_overlap_period": 12,
+        "macd_fast_period": 5,
+        "macd_slow_period": 34,
+        "macd_signal_period": 6,
+    }
+    selected = [
+        "atr_10",
+        "candle_range_to_atr_10",
+        "rsi_7",
+        "ema_9",
+        "rolling_overlap_12",
+        "macd_histogram_5_34_6",
+    ]
+    with TestClient(create_app(Settings(root))) as client:
+        catalog = client.get(
+            "/api/v1/features",
+            params=settings,
+        ).json()
+        bars_payload = client.get(
+            "/api/v1/bars",
+            params={
+                "symbol": "EURUSD",
+                "timeframe": "H1",
+                **settings,
+                "features": ",".join(selected),
+            },
+        ).json()
+        export = client.get(
+            "/api/v1/export",
+            params={
+                "symbol": "EURUSD",
+                "timeframe": "H1",
+                "features": ",".join(selected),
+                "format": "csv",
+                **settings,
+            },
+        )
+    offered = {feature["name"]: feature for feature in catalog["export_features"]}
+    assert offered["atr_10"]["parameters"] == {"period": 10}
+    assert offered["candle_range_to_atr_10"]["parameters"] == {"atr_period": 10}
+    assert offered["rolling_overlap_12"]["parameters"] == {"period": 12}
+    assert offered["macd_5_34_6"]["parameters"] == {
+        "fast_period": 5,
+        "slow_period": 34,
+        "signal_period": 6,
+    }
+    views = {view["id"]: view for view in bars_payload["indicators"]}
+    assert views["atr_10"]["label"] == "ATR"
+    assert views["ema_9"]["label"] == "EMA"
+    assert views["rsi_7"]["label"] == "RSI"
+    assert export.status_code == 200
+    with ZipFile(BytesIO(export.content)) as archive:
+        table = next(name for name in archive.namelist() if name.endswith(".csv"))
+        metadata_name = next(name for name in archive.namelist() if name.endswith(".json"))
+        exported = list(csv.DictReader(archive.read(table).decode().splitlines()))
+        metadata = json.loads(archive.read(metadata_name))
+    canonical = ["asset", "timeframe", "time", "open", "high", "low", "close", "volume"]
+    assert list(exported[0]) == canonical + selected
+    assert len(exported) == len(rows) - metadata["export_warm_up_rows"]
+    assert metadata["export_warm_up_rows"] == 100
+    assert [feature["name"] for feature in metadata["features"]] == selected
+    assert "atr_20" not in exported[0] and "ema_20" not in exported[0]
+    api_views = {name: views[name] for name in selected}
+    export_time = int(exported[0]["time"])
+    for name in selected:
+        points = api_views[name]["points"] or api_views[name]["values"]
+        api_value = next(point["value"] for point in points if point["time"] == export_time)
+        assert float(exported[0][name]) == pytest.approx(api_value)
+
+
+def test_period_settings_keep_custom_registered_feature_definitions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def custom_definition(name: str, parameters: dict[str, int]) -> FeatureDefinition:
+        spec = FeatureSpec(name, "Float64", parameters)
+
+        def calculate(bars: Sequence[Bar]) -> FeatureTable:
+            values: list[float | None] = [bar.close for bar in bars]
+            return FeatureTable.from_columns((spec,), [bar.time for bar in bars], {name: values})
+
+        return FeatureDefinition(
+            (spec,),
+            calculate,
+            (FeatureViewSpec(name, name, name, "Custom registered feature", None),),
+        )
+
+    custom_macd = custom_definition(
+        "macd_divergence", {"fast_period": 3, "slow_period": 7, "signal_period": 2}
+    )
+    custom_atr = custom_definition("custom_atr_ratio", {"atr_period": 20})
+    registered = discover() + (custom_macd, custom_atr)
+    monkeypatch.setattr("app.main.discover", lambda: registered)
+    root = market_root(tmp_path, [valid(1), valid(2)])
+
+    with TestClient(create_app(Settings(root))) as client:
+        response = client.get(
+            "/api/v1/features",
+            params={
+                "atr_period": 10,
+                "macd_fast_period": 5,
+                "macd_slow_period": 34,
+                "macd_signal_period": 6,
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    view_ids = [view["id"] for view in payload["indicators"]]
+    export_names = [feature["name"] for feature in payload["export_features"]]
+    assert view_ids.count("macd_divergence") == 1
+    assert "custom_atr_ratio" in view_ids
+    assert "macd_5_34_6" in view_ids
+    assert len(view_ids) == len(set(view_ids))
+    assert export_names.count("macd_divergence") == 1
+    assert "custom_atr_ratio" in export_names
+    assert "macd_5_34_6" in export_names
+
+
+def test_new_configurable_feature_needs_no_api_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from io import BytesIO
+    from zipfile import ZipFile
+
+    def custom_feature(period: int = 3) -> FeatureDefinition:
+        name = f"custom_score_{period}"
+        spec = FeatureSpec(
+            name,
+            "Float64",
+            {"window": period},
+            warm_up=period - 1,
+            selection_key="custom_score",
+        )
+
+        def calculate(source: Sequence[Bar]) -> FeatureTable:
+            values = [None if index < period - 1 else float(period) for index in range(len(source))]
+            return FeatureTable.from_columns((spec,), [bar.time for bar in source], {name: values})
+
+        return FeatureDefinition(
+            (spec,),
+            calculate,
+            (
+                FeatureViewSpec(
+                    name,
+                    name,
+                    "Custom score",
+                    "Configurable test indicator",
+                    None,
+                    selection_key="custom_score",
+                ),
+            ),
+            calculation_warm_up=period,
+            settings=(
+                FeatureSetting("custom_period", "Custom period", 3, 2, 10, parameters=("window",)),
+            ),
+            configure=lambda values: custom_feature(values["custom_period"]),
+        )
+
+    monkeypatch.setattr("app.main.discover", lambda: discover() + (custom_feature(),))
+    root = market_root(tmp_path, [valid(100 + index) for index in range(120)])
+    with TestClient(create_app(Settings(root))) as client:
+        catalog = client.get("/api/v1/features", params={"custom_period": 5}).json()
+        chart = client.get(
+            "/api/v1/bars",
+            params={
+                "symbol": "EURUSD",
+                "timeframe": "H1",
+                "custom_period": 5,
+                "features": "custom_score_5",
+            },
+        ).json()
+        export = client.get(
+            "/api/v1/export",
+            params={
+                "symbol": "EURUSD",
+                "timeframe": "H1",
+                "custom_period": 5,
+                "features": "custom_score_5",
+                "format": "csv",
+            },
+        )
+        invalid = client.get("/api/v1/features", params={"custom_period": 11})
+
+    assert {setting["key"] for setting in catalog["settings"]} >= {"custom_period"}
+    offered = {entry["name"]: entry for entry in catalog["export_features"]}
+    assert offered["custom_score_5"]["selection_key"] == "custom_score"
+    assert "custom_score_3" not in offered
+    view = next(entry for entry in chart["indicators"] if entry["id"] == "custom_score_5")
+    assert view["selection_key"] == "custom_score"
+    assert view["values"][-1]["value"] == 5.0
+    assert export.status_code == 200
+    with ZipFile(BytesIO(export.content)) as archive:
+        assert "custom_score_5" in archive.read("bar_features.csv").decode().splitlines()[0]
+    restored = configure_stored_features(
+        (custom_feature(),),
+        (FeatureSpec("custom_score_5", "Float64", {"window": 5}, selection_key="custom_score"),),
+    )
+    assert restored[0].specs[0].name == "custom_score_5"
+    assert invalid.status_code == 422 and "custom_period" in invalid.text
+
+
+def test_chart_loads_enough_history_for_selected_long_period(tmp_path: Path) -> None:
+    root = tmp_path / "market"
+    root.mkdir()
+    rows = [
+        (100 + index, 100 + index, 102 + index, 99 + index, 101 + index, 1) for index in range(160)
+    ]
+    write_csv(root / "EURUSD_H1.csv", rows)
+    with TestClient(create_app(Settings(root))) as client:
+        response = client.get(
+            "/api/v1/bars",
+            params={
+                "symbol": "EURUSD",
+                "timeframe": "H1",
+                "limit": 1,
+                "atr_period": 120,
+                "rsi_period": 120,
+                "features": "atr_120,rsi_120",
+            },
+        )
+    assert response.status_code == 200
+    definitions = {feature["id"]: feature for feature in response.json()["indicators"]}
+    assert len(response.json()["bars"]) == 1
+    assert len(definitions["atr_120"]["values"]) == 1
+    assert definitions["atr_120"]["values"][0]["value"] == pytest.approx(3.0)
+    assert definitions["rsi_120"]["values"][0]["value"] == 100
+
+
+def test_period_query_validation_returns_actionable_errors(tmp_path: Path) -> None:
+    root = tmp_path / "market"
+    root.mkdir()
+    write_csv(root / "EURUSD_H1.csv", [valid(100)])
+    with TestClient(create_app(Settings(root))) as client:
+        invalid_atr = client.get("/api/v1/features", params={"atr_period": 0})
+        invalid_macd = client.get(
+            "/api/v1/features",
+            params={"macd_fast_period": 26, "macd_slow_period": 12},
+        )
+    assert invalid_atr.status_code == 422
+    assert "atr_period" in invalid_atr.text
+    assert invalid_macd.status_code == 422
+    assert "fast period must be below slow period" in invalid_macd.json()["detail"]
+
+
+def test_stored_chart_uses_matching_period_specific_indicator_views(tmp_path: Path) -> None:
+    source_root = tmp_path / "market"
+    source_root.mkdir()
+    source = write_csv(
+        source_root / "EURUSD_H1.csv",
+        [
+            (100 + index, 100 + index, 102 + index, 99 + index, 101 + index, 1)
+            for index in range(130)
+        ],
+    )
+    stored_root = tmp_path / "stored"
+    definitions = configure_features(
+        discover(),
+        {"atr_period": 10, "macd_fast_period": 5, "macd_slow_period": 8, "macd_signal_period": 3},
+    )
+    export_bar_features(
+        source,
+        stored_root,
+        "EURUSD",
+        "H1",
+        [
+            "atr_10",
+            "candle_range_to_atr_10",
+            "macd_5_8_3",
+            "macd_signal_5_8_3",
+            "macd_histogram_5_8_3",
+        ],
+        "csv",
+        definitions=definitions,
+    )
+    with TestClient(create_app(Settings(source_root, stored_data_root=stored_root))) as client:
+        response = client.get(
+            "/api/v1/bars",
+            params={"mode": "stored", "symbol": "EURUSD", "timeframe": "H1"},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    indicators = {indicator["id"]: indicator for indicator in payload["indicators"]}
+    assert "atr_10" in indicators
+    assert "atr_10_pane" in indicators
+    assert indicators["atr_10"]["label"] == "ATR"
+    assert indicators["atr_10"]["values"] == payload["stored_values"]["atr_10"]
+    for name in (
+        "candle_range_to_atr_10",
+        "macd_5_8_3",
+        "macd_signal_5_8_3",
+        "macd_histogram_5_8_3",
+    ):
+        assert indicators[name]["values"] == payload["stored_values"][name]

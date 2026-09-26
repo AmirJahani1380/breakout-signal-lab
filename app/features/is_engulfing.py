@@ -48,6 +48,7 @@ feature = FeatureDefinition(
             "Engulfing",
             "Opposite candle opens inside and closes beyond prior range",
             None,
+            candle_color="#ffd600",
         ),
     ),
     calculation_warm_up=1,

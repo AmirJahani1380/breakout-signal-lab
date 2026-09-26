@@ -13,14 +13,19 @@ from typing import Literal
 import pandas as pd
 
 from app.bars import Bar, load_bars
-from app.features import FeatureDefinition, FeatureSpec, FeatureTable, discover
-from app.features.atr_20 import Atr20State
+from app.features import (
+    FeatureDefinition,
+    FeatureSpec,
+    FeatureTable,
+    calculate_requested,
+    discover,
+)
+from app.features.atr import AtrState
 from app.features.candle_measurements import measure_candles
-from app.features.ema_20 import ema_step as _ema
+from app.features.ema import ema_step as _ema
 from app.features.is_engulfing import _engulfs
-from app.features.macd import MacdState
-from app.features.rolling_overlap_20 import overlap_score
-from app.features.rsi_14 import Rsi14State
+from app.features.rolling_overlap import overlap_score
+from app.features.rsi import RsiState
 
 
 class FeatureExportError(ValueError):
@@ -50,9 +55,8 @@ class _BarFeatureState:
         self.previous: Bar | None = None
         self.previous_bars: deque[Bar] = deque(maxlen=20)
         self.ema_20: float | None = None
-        self.macd = MacdState()
-        self.atr = Atr20State()
-        self.rsi = Rsi14State()
+        self.atr = AtrState()
+        self.rsi = RsiState()
 
     def add(self, bar: Bar, selected: frozenset[str]) -> dict[str, float | int | bool | None]:
         # Dataset-start seed: first close for EMAs, first high-low for ATR, and
@@ -64,12 +68,6 @@ class _BarFeatureState:
         lower_wick = measured.lower_wick[0]
         if "ema_20" in selected:
             self.ema_20 = _ema(self.ema_20, bar.close, 20)
-        macd: float | None = None
-        macd_signal: float | None = None
-        if selected & {"macd", "macd_signal", "macd_histogram"}:
-            macd, macd_signal = self.macd.add(
-                bar.close, bool(selected & {"macd_signal", "macd_histogram"})
-            )
         atr: float | None = None
         if (
             "atr_20" in selected
@@ -96,11 +94,6 @@ class _BarFeatureState:
             "ema_20": self.ema_20,
             "rsi_14": rsi,
             "atr_20": atr,
-            "macd": macd,
-            "macd_signal": macd_signal,
-            "macd_histogram": macd - macd_signal
-            if macd is not None and macd_signal is not None
-            else None,
             "rolling_overlap_20": overlap,
             "rolling_overlap_20_above_half": None
             if overlap is None or overlap == 0.5
@@ -147,6 +140,44 @@ def build_feature_frame(
     if set(feature_names) & {"asset", "timeframe", "time", "open", "high", "low", "close"}:
         raise FeatureExportError("selected features conflict with canonical columns")
     selected = frozenset(feature_names)
+    bundled_definitions = {
+        spec.name: definition for definition in bundled for spec in definition.specs
+    }
+    for definition in registered:
+        for spec in definition.specs:
+            if (
+                spec.name in selected
+                and spec.name in bundled_definitions
+                and definition is not bundled_definitions[spec.name]
+            ):
+                raise FeatureExportError(
+                    f"{spec.name}: supplied definition does not match "
+                    "the bundled incremental calculator"
+                )
+    dynamic_names = {
+        spec.name
+        for definition in registered
+        for spec in definition.specs
+        if spec.name in selected
+        and (spec.parameters or spec.warm_up or definition.calculation_warm_up)
+        and spec.name not in {"ema_20", "rsi_14", "atr_20", "rolling_overlap_20"}
+    }
+    precomputed: dict[str, list[object]] = {}
+    for definition in registered:
+        selected_dynamic = dynamic_names & {spec.name for spec in definition.specs}
+        if selected_dynamic:
+            calculation_names = (
+                frozenset(selected_dynamic)
+                if definition.calculate_selected is not None
+                else frozenset(spec.name for spec in definition.specs)
+            )
+            table = calculate_requested(definition, bars, calculation_names)
+            if table is None:
+                raise FeatureExportError(
+                    f"selected feature calculator returned an invalid table: "
+                    f"{sorted(selected_dynamic)!r}"
+                )
+            precomputed.update({name: table.frame[name].tolist() for name in selected_dynamic})
     built_in = {
         "candle_range",
         "body_size",
@@ -160,9 +191,6 @@ def build_feature_frame(
         "ema_20",
         "rsi_14",
         "atr_20",
-        "macd",
-        "macd_signal",
-        "macd_histogram",
         "rolling_overlap_20",
         "rolling_overlap_20_above_half",
     }
@@ -174,16 +202,7 @@ def build_feature_frame(
         in {"candle_range", "body_size", "upper_wick", "lower_wick", "atr_20"}
         and name.rsplit("_to_", 1)[-1] in {"atr_20", "close"}
     )
-    bundled_by_name = {spec.name: definition for definition in bundled for spec in definition.specs}
-    for definition in registered:
-        for spec in definition.specs:
-            if spec.name in selected & built_in and definition is not bundled_by_name.get(
-                spec.name
-            ):
-                raise FeatureExportError(
-                    f"{spec.name}: supplied definition does not match "
-                    "the bundled incremental calculator"
-                )
+    built_in.update(dynamic_names)
     custom_definitions: list[tuple[FeatureDefinition, frozenset[str]]] = []
     for definition in registered:
         custom_names = (selected - built_in) & {spec.name for spec in definition.specs}
@@ -198,11 +217,14 @@ def build_feature_frame(
     state = _BarFeatureState()
     rows: list[dict[str, object]] = []
     prior_time: int | None = None
-    for bar in bars:
+    for row_index, bar in enumerate(bars):
         if prior_time is not None and bar.time <= prior_time:
             raise FeatureExportError("bars must have unique, chronological timestamps")
         try:
-            values = state.add(bar, selected & built_in)
+            values: dict[str, object] = {
+                **state.add(bar, (selected & built_in) - dynamic_names),
+                **{name: column[row_index] for name, column in precomputed.items()},
+            }
             for definition, names in custom_definitions:
                 table = (
                     definition.calculate_selected((bar,), names)
@@ -309,8 +331,7 @@ def export_bar_features(
         "timestamp": "time: UTC Unix seconds, int64",
         "row_key": ["dataset_id", "time"],
         "seed_policy": (
-            "dataset start; EMA first close, ATR first 20 true ranges, "
-            "RSI first 14 close changes; rolling overlap previous 20 bars. "
+            "Recursive indicators are seeded from the dataset start. "
             f"The first {warm_up} source rows establish feature state and are not exported."
         ),
         "export_warm_up_rows": warm_up,

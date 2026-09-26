@@ -6,8 +6,14 @@ from fastapi.testclient import TestClient
 
 from app import features as feature_package
 from app.bars import Bar
-from app.features.ema_20 import calculate as calculate_ema_20
-from app.features.rsi_14 import calculate as calculate_rsi_14
+from app.features.atr import make_feature as make_atr_feature
+from app.features.ema import calculate as calculate_default_ema
+from app.features.ema import make_feature as make_ema_feature
+from app.features.macd import make_feature as make_macd_feature
+from app.features.normalized_candles import make_feature as make_normalized_feature
+from app.features.rolling_overlap import make_feature as make_overlap_feature
+from app.features.rsi import calculate as calculate_default_rsi
+from app.features.rsi import make_feature as make_rsi_feature
 from app.main import Settings, create_app
 from tests.test_bars import write_workbook
 
@@ -17,20 +23,22 @@ def price_bars(closes: list[float]) -> tuple[Bar, ...]:
 
 
 def test_ema_20_is_empty_or_seeded_by_first_close() -> None:
-    assert calculate_ema_20(()).frame.empty
-    values = calculate_ema_20(price_bars([1.0, 2.0, 3.0])).frame["ema_20"].tolist()
+    assert calculate_default_ema(()).frame.empty
+    values = calculate_default_ema(price_bars([1.0, 2.0, 3.0])).frame["ema_20"].tolist()
     assert values == pytest.approx((1.0, 1.0952380952, 1.2766439909))
 
 
 def test_rsi_14_handles_warmup_flat_and_directional_prices() -> None:
-    assert calculate_rsi_14(price_bars([1.0] * 14)).frame["rsi_14"].isna().all()
-    assert calculate_rsi_14(price_bars([1.0] * 15)).frame["rsi_14"].iloc[-1] == 50
+    assert calculate_default_rsi(price_bars([1.0] * 14)).frame["rsi_14"].isna().all()
+    assert calculate_default_rsi(price_bars([1.0] * 15)).frame["rsi_14"].iloc[-1] == 50
     assert (
-        calculate_rsi_14(price_bars([float(value) for value in range(15)])).frame["rsi_14"].iloc[-1]
+        calculate_default_rsi(price_bars([float(value) for value in range(15)]))
+        .frame["rsi_14"]
+        .iloc[-1]
         == 100
     )
     assert (
-        calculate_rsi_14(price_bars([float(value) for value in range(15, 0, -1)]))
+        calculate_default_rsi(price_bars([float(value) for value in range(15, 0, -1)]))
         .frame["rsi_14"]
         .iloc[-1]
         == 0
@@ -39,9 +47,66 @@ def test_rsi_14_handles_warmup_flat_and_directional_prices() -> None:
 
 def test_rsi_14_uses_wilder_smoothing_after_seed() -> None:
     closes = [float(value) for value in range(1, 16)] + [14.0]
-    assert calculate_rsi_14(price_bars(closes)).frame["rsi_14"].iloc[-1] == pytest.approx(
+    assert calculate_default_rsi(price_bars(closes)).frame["rsi_14"].iloc[-1] == pytest.approx(
         92.8571428571
     )
+
+
+def test_period_settings_change_specs_labels_and_calculated_values() -> None:
+    source = price_bars([float(value) for value in range(1, 41)])
+    configured = (
+        make_atr_feature(10),
+        make_rsi_feature(7),
+        make_ema_feature(9),
+        make_overlap_feature(12),
+        make_macd_feature(5, 34, 6),
+    )
+    assert [spec.name for spec in configured[0].specs] == ["atr_10"]
+    assert configured[0].specs[0].parameters == {"period": 10}
+    assert configured[0].calculate(source).frame["atr_10"].iloc[9] == pytest.approx(0.9)
+    assert configured[1].specs[0].name == "rsi_7"
+    assert configured[1].calculate(source).frame["rsi_7"].iloc[7] == 100
+    assert (
+        configured[2].calculate(source).frame["ema_9"].iloc[1]
+        != calculate_default_ema(source).frame["ema_20"].iloc[1]
+    )
+    assert configured[3].specs[0].name == "rolling_overlap_12"
+    assert configured[4].specs[0].parameters == {
+        "fast_period": 5,
+        "slow_period": 34,
+        "signal_period": 6,
+    }
+    assert configured[4].specs[1].parameters == configured[4].specs[0].parameters
+    assert [view.label for view in configured[4].views] == [
+        "MACD",
+        "MACD signal",
+        "MACD histogram",
+    ]
+    assert "5/34" in configured[4].views[0].description
+    assert "6-period" in configured[4].views[1].description
+    assert "6-period" in configured[4].views[2].description
+    relative = make_normalized_feature(10)
+    atr_view = next(view for view in relative.views if view.identifier == "candle_range_to_atr_10")
+    assert atr_view.label == "Candle Range To Atr"
+    assert atr_view.selection_key == "candle_range_to_atr"
+
+
+@pytest.mark.parametrize(
+    ("factory", "arguments", "message"),
+    [
+        (make_atr_feature, (0,), "ATR period"),
+        (make_ema_feature, (True,), "EMA period"),
+        (make_rsi_feature, (1.5,), "RSI period"),
+        (make_overlap_feature, (1,), "rolling overlap period"),
+        (make_macd_feature, (26, 12, 9), "fast period must be below slow period"),
+        (make_normalized_feature, (0,), "ATR period for normalized candles"),
+    ],
+)
+def test_period_factories_reject_invalid_settings(
+    factory: object, arguments: tuple[object, ...], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        factory(*arguments)  # type: ignore[operator]
 
 
 def test_discovers_test_feature_and_skips_invalid_modules(

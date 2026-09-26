@@ -4,11 +4,11 @@ import pandas as pd
 import pytest
 
 from app.bars import Bar
-from app.features.atr_20 import calculate as calculate_atr
+from app.features.atr import calculate as calculate_atr
 from app.features.normalized_candles import calculate as calculate_normalized
-from app.features.rolling_overlap_20 import calculate as calculate_overlap
-from app.features.rolling_overlap_20 import feature as overlap_feature
-from app.features.rolling_overlap_20 import overlap_score
+from app.features.rolling_overlap import calculate as calculate_overlap
+from app.features.rolling_overlap import feature as overlap_feature
+from app.features.rolling_overlap import overlap_score
 
 
 def candle(

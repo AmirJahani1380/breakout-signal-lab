@@ -3,12 +3,12 @@ from __future__ import annotations
 import json
 from io import StringIO
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
 import pytest
 from playwright.sync_api import Page
 
-from tests.browser_fixtures import page, viewer_url  # noqa: F401
 
 def test_symbol_then_timeframe_loads_only_the_selected_chart(page: Page, viewer_url: str) -> None:
     page.goto(viewer_url)
@@ -542,7 +542,7 @@ def test_feature_labels_and_engulfing_candle_color_toggle(page: Page, viewer_url
     engulfing = panel.locator('[data-indicator="is_engulfing"]')
     assert engulfing.locator("small").text_content().startswith("candle color ·")
     engulfing.locator("[data-apply]").check()
-    page.wait_for_function("document.querySelector('#chart').dataset.engulfingCount === '1'")
+    page.wait_for_function("document.querySelector('#chart').dataset.candleColorCount === '1'")
     page.wait_for_function(
         """() => [...document.querySelectorAll('#chart canvas')].some((canvas) => {
             const pixels = canvas.getContext('2d')
@@ -554,7 +554,7 @@ def test_feature_labels_and_engulfing_candle_color_toggle(page: Page, viewer_url
         })"""
     )
     engulfing.locator("[data-apply]").uncheck()
-    assert page.locator("#chart").get_attribute("data-engulfing-count") == "0"
+    assert page.locator("#chart").get_attribute("data-candle-color-count") == "0"
 
     candle_range = panel.locator('[data-indicator="candle_range"]')
     main_series_count = page.evaluate("window.__breakoutChart.panes()[0].getSeries().length")
@@ -683,17 +683,20 @@ def test_marker_renderer_draws_markers_without_adding_a_line_series(
         "points": [{"time": time, "value": 2} for time in times],
         "values": [{"time": time, "value": 2} for time in times],
     }
-    page.route(
-        "**/api/v1/bars**",
-        lambda route: route.fulfill(
+
+    def respond(route: object) -> None:
+        query = parse_qs(urlparse(route.request.url).query)  # type: ignore[attr-defined]
+        indicators = [] if query.get("atr_period") == ["10"] else [marker]
+        route.fulfill(  # type: ignore[attr-defined]
             json={
                 "bars": bars,
-                "indicators": [marker],
+                "indicators": indicators,
                 "next_before": None,
                 "has_more": False,
             }
-        ),
-    )
+        )
+
+    page.route("**/api/v1/bars**", respond)
     select_timeframe(page, viewer_url, "M15")
     page.wait_for_function("document.querySelector('#chart').dataset.markerCount === '3'")
     page.locator("#chart canvas").first.wait_for()
@@ -709,3 +712,226 @@ def test_marker_renderer_draws_markers_without_adding_a_line_series(
             return false;
         })"""
     )
+    period = page.locator('[data-period="atr_period"]')
+    period.fill("10")
+    period.press("Tab")
+    page.wait_for_function("document.querySelector('#chart').dataset.markerCount === '0'")
+    assert not page.evaluate(
+        """() => [...document.querySelectorAll('#chart canvas')].some((canvas) => {
+            if (!canvas.width || !canvas.height) return false;
+            const pixels = canvas.getContext('2d').getImageData(
+                0, 0, canvas.width, canvas.height).data;
+            for (let index = 0; index < pixels.length; index += 4)
+                if (pixels[index] === 0 && pixels[index + 1] === 255
+                    && pixels[index + 2] === 255) return true;
+            return false;
+        })"""
+    )
+
+
+def test_period_change_keeps_numbered_custom_export_columns_distinct(
+    page: Page, viewer_url: str
+) -> None:
+    def add_custom_features(route: object) -> None:
+        response = route.fetch()  # type: ignore[attr-defined]
+        payload = response.json()
+        payload["export_features"].extend(
+            [
+                {"name": "score_1"},
+                {"name": "score_2"},
+                {"name": "atr_10_custom"},
+                {"name": "atr_20_custom"},
+            ]
+        )
+        route.fulfill(json=payload)  # type: ignore[attr-defined]
+
+    page.route("**/api/v1/features**", add_custom_features)
+    page.goto(viewer_url)
+    page.get_by_role("tab", name="Export").click()
+    page.locator('#export-features input[value="score_1"]').wait_for()
+    for checkbox in page.locator("#export-features input").all():
+        checkbox.uncheck()
+    page.locator('#export-features input[value="score_1"]').check()
+    page.locator('#export-features input[value="atr_10_custom"]').check()
+    period = page.locator('[data-period="atr_period"]')
+    period.fill("10")
+    period.press("Tab")
+    page.locator('#export-features input[value="atr_10"]').wait_for()
+    assert page.locator("#export-features input:checked").evaluate_all(
+        "inputs => inputs.map(input => input.value)"
+    ) == ["score_1", "atr_10_custom"]
+
+
+def test_rapid_period_changes_ignore_stale_catalog_completions(page: Page, viewer_url: str) -> None:
+    select_timeframe(page, viewer_url)
+    page.wait_for_function("document.querySelector('#chart').dataset.barCount === '1000'")
+    page.get_by_role("tab", name="Indicators").click()
+    atr = page.locator('[data-indicator="atr_20"]')
+    if not atr.locator("[data-apply]").is_checked():
+        atr.locator("[data-apply]").check()
+    if atr.locator("[data-visibility]").inner_text() == "Hide":
+        atr.locator("[data-visibility]").click()
+    page.wait_for_load_state("networkidle")
+
+    catalog_routes: list[object] = []
+    bar_requests: list[str] = []
+    page.on(
+        "request",
+        lambda request: (
+            bar_requests.append(request.url) if "/api/v1/bars?" in request.url else None
+        ),
+    )
+
+    def hold_catalog(route: object) -> None:
+        catalog_routes.append(route)
+
+    page.route("**/api/v1/catalog**", hold_catalog)
+    baseline_bar_requests = len(bar_requests)
+    period = page.locator('[data-period="atr_period"]')
+    with page.expect_request("**/api/v1/catalog**"):
+        period.fill("10")
+        period.press("Tab")
+    page.wait_for_timeout(20)
+    assert len(catalog_routes) == 1
+    with page.expect_request("**/api/v1/catalog**"):
+        period.fill("11")
+        period.press("Tab")
+    page.wait_for_timeout(20)
+    assert len(catalog_routes) == 2
+
+    catalog_routes[0].fulfill(  # type: ignore[attr-defined]
+        json={"symbols": [{"symbol": "STALE", "timeframes": ["D1"]}]}
+    )
+    page.wait_for_timeout(50)
+    assert len(bar_requests) == baseline_bar_requests
+    catalog_routes[1].fulfill(  # type: ignore[attr-defined]
+        json={
+            "symbols": [
+                {"symbol": "EURUSD", "timeframes": ["H1"]},
+                {"symbol": "LATEST", "timeframes": ["D1"]},
+            ]
+        }
+    )
+    page.wait_for_function("document.querySelector('#symbol option[value=LATEST]') !== null")
+    page.wait_for_function("document.querySelector('#chart').dataset.barCount === '1000'")
+    assert page.locator('[data-indicator="atr_11"] [data-apply]').is_checked()
+    assert (
+        page.locator('[data-indicator="atr_11"] [data-indicator-state]').inner_text()
+        == "Applied · Hidden"
+    )
+
+
+def test_period_setting_updates_chart_and_export_feature_names(page: Page, viewer_url: str) -> None:
+    page.goto(viewer_url)
+    period = page.locator('[data-period="atr_period"]')
+    period.fill("10")
+    period.press("Tab")
+    page.wait_for_function("document.querySelector('[data-indicator=atr_10]')")
+    page.locator("#symbol").select_option("EURUSD")
+    page.get_by_role("button", name="H1").click()
+    page.wait_for_function("document.querySelector('#chart').dataset.barCount === '1000'")
+    page.get_by_role("tab", name="Indicators").click()
+    assert page.locator('[data-indicator="atr_10"]').count() == 1
+    assert page.locator('[data-indicator="atr_20"]').count() == 0
+    page.locator('[data-indicator="atr_10"] [data-apply]').check()
+    assert (
+        page.locator('[data-indicator="atr_10"] [data-indicator-state]').inner_text()
+        == "Applied · Visible"
+    )
+    page.locator('[data-indicator="atr_10"] [data-visibility]').click()
+    assert (
+        page.locator('[data-indicator="atr_10"] [data-indicator-state]').inner_text()
+        == "Applied · Hidden"
+    )
+    page.get_by_role("tab", name="Export").click()
+    export_names = page.locator("#export-features input").evaluate_all(
+        "inputs => inputs.map(input => input.value)"
+    )
+    assert "atr_10" in export_names
+    assert "atr_20" not in export_names
+    for checkbox in page.locator("#export-features input").all():
+        checkbox.uncheck()
+    page.locator('#export-features input[value="atr_10"]').check()
+    period.fill("11")
+    period.press("Tab")
+    page.wait_for_function("document.querySelector('#export-features input[value=atr_11]')")
+    assert page.locator('[data-indicator="atr_11"] [data-apply]').is_checked()
+    assert (
+        page.locator('[data-indicator="atr_11"] [data-indicator-state]').inner_text()
+        == "Applied · Hidden"
+    )
+    assert page.locator('[data-indicator="atr_11"] [data-visibility]').inner_text() == "Show"
+    assert page.locator("#export-features input:checked").evaluate_all(
+        "inputs => inputs.map(input => input.value)"
+    ) == ["atr_11"]
+    export_requests: list[dict[str, list[str]]] = []
+
+    def capture_export(route: object) -> None:
+        request = route.request  # type: ignore[attr-defined]
+        export_requests.append(parse_qs(urlparse(request.url).query))
+        route.fulfill(  # type: ignore[attr-defined]
+            status=200,
+            body=b"fake archive",
+            headers={
+                "Content-Type": "application/zip",
+                "Content-Disposition": 'attachment; filename="bar_features_csv.zip"',
+            },
+        )
+
+    page.route("**/api/v1/export**", capture_export)
+    with page.expect_download():
+        page.get_by_role("button", name="Download CSV").click()
+    assert len(export_requests) == 1
+    assert export_requests[0]["features"] == ["atr_11"]
+    assert export_requests[0]["atr_period"] == ["11"]
+    assert export_requests[0]["rsi_period"] == ["14"]
+    assert export_requests[0]["macd_fast_period"] == ["12"]
+
+
+def test_new_feature_setting_renders_and_reaches_chart_and_export(
+    page: Page, viewer_url: str
+) -> None:
+    def add_setting(route: object) -> None:
+        payload = route.fetch().json()  # type: ignore[attr-defined]
+        payload["settings"].append(
+            {
+                "key": "custom_period",
+                "label": "Custom period",
+                "default": 3,
+                "minimum": 2,
+                "maximum": 10,
+            }
+        )
+        route.fulfill(json=payload)  # type: ignore[attr-defined]
+
+    page.route("**/api/v1/features**", add_setting)
+    select_timeframe(page, viewer_url)
+    custom = page.locator('[data-period="custom_period"]')
+    assert custom.input_value() == "3"
+    with page.expect_request(
+        lambda request: (
+            "/api/v1/bars?" in request.url
+            and parse_qs(urlparse(request.url).query).get("custom_period") == ["7"]
+        )
+    ):
+        custom.fill("7")
+        custom.press("Tab")
+
+    export_requests: list[dict[str, list[str]]] = []
+
+    def capture_export(route: object) -> None:
+        export_requests.append(parse_qs(urlparse(route.request.url).query))  # type: ignore[attr-defined]
+        route.fulfill(  # type: ignore[attr-defined]
+            status=200,
+            body=b"fake archive",
+            headers={
+                "Content-Type": "application/zip",
+                "Content-Disposition": 'attachment; filename="bar_features_csv.zip"',
+            },
+        )
+
+    page.route("**/api/v1/export**", capture_export)
+    page.get_by_role("tab", name="Export").click()
+    with page.expect_download():
+        page.get_by_role("button", name="Download CSV").click()
+    assert export_requests[0]["custom_period"] == ["7"]

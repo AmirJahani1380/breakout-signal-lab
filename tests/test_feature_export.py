@@ -10,9 +10,10 @@ from fastapi.testclient import TestClient
 from app.bars import Bar
 from app.feature_export import FeatureExportError, build_feature_frame, export_bar_features
 from app.features import FeatureDefinition, FeatureSpec, FeatureTable, discover
-from app.features.atr_20 import atr_20_values
-from app.features.ema_20 import calculate as calculate_ema
-from app.features.rsi_14 import calculate as calculate_rsi
+from app.features.atr import atr_values
+from app.features.configuration import configure_features
+from app.features.ema import calculate as calculate_ema
+from app.features.rsi import calculate as calculate_rsi
 from app.main import Settings, create_app
 from tests.test_bars import write_csv
 
@@ -28,7 +29,7 @@ def test_incremental_recursive_values_match_existing_calculations() -> None:
     )
     for name, expected in (
         ("ema_20", calculate_ema(source).frame["ema_20"]),
-        ("atr_20", pd.Series(atr_20_values(source), dtype="Float64")),
+        ("atr_20", pd.Series(atr_values(source), dtype="Float64")),
         ("rsi_14", calculate_rsi(source).frame["rsi_14"].reset_index(drop=True)),
     ):
         pd.testing.assert_series_equal(
@@ -76,18 +77,16 @@ def test_export_calculates_from_prior_bar_state(
     monkeypatch.setattr(feature_export, "_ema", track_ema)
     atr_inputs: list[float | None] = []
     rsi_inputs: list[float | None] = []
-    macd_inputs: list[float | None] = []
     overlap_lengths: list[int] = []
-    original_atr = feature_export.Atr20State.add
-    original_rsi = feature_export.Rsi14State.add
-    original_macd = feature_export.MacdState.add
+    original_atr = feature_export.AtrState.add
+    original_rsi = feature_export.RsiState.add
     original_overlap = feature_export.overlap_score
 
-    def track_atr(state: feature_export.Atr20State, bar: Bar) -> float | None:
+    def track_atr(state: feature_export.AtrState, bar: Bar) -> float | None:
         atr_inputs.append(state.previous_close)
         return original_atr(state, bar)
 
-    def track_rsi(state: feature_export.Rsi14State, close: float) -> float | None:
+    def track_rsi(state: feature_export.RsiState, close: float) -> float | None:
         rsi_inputs.append(state.previous_close)
         return original_rsi(state, close)
 
@@ -96,28 +95,20 @@ def test_export_calculates_from_prior_bar_state(
         overlap_lengths.append(len(window))
         return original_overlap(window)
 
-    def track_macd(
-        state: feature_export.MacdState, close: float, needs_signal: bool
-    ) -> tuple[float, float | None]:
-        macd_inputs.append(state.fast)
-        return original_macd(state, close, needs_signal)
-
-    monkeypatch.setattr(feature_export.Atr20State, "add", track_atr)
-    monkeypatch.setattr(feature_export.Rsi14State, "add", track_rsi)
-    monkeypatch.setattr(feature_export.MacdState, "add", track_macd)
+    monkeypatch.setattr(feature_export.AtrState, "add", track_atr)
+    monkeypatch.setattr(feature_export.RsiState, "add", track_rsi)
     monkeypatch.setattr(feature_export, "overlap_score", track_overlap)
     build_feature_frame(
         bars(200),
         "EURUSD",
         "H1",
-        ["ema_20", "macd_histogram", "atr_20", "rsi_14", "rolling_overlap_20"],
+        ["ema_20", "macd_histogram_12_26_9", "atr_20", "rsi_14", "rolling_overlap_20"],
     )
     assert len(updates) == 200
     assert updates[0] is None and all(value is not None for value in updates[1:])
-    assert len(atr_inputs) == len(rsi_inputs) == len(macd_inputs) == len(overlap_lengths) == 200
+    assert len(atr_inputs) == len(rsi_inputs) == len(overlap_lengths) == 200
     assert atr_inputs[0] is rsi_inputs[0] is None
     assert all(value is not None for value in atr_inputs[1:] + rsi_inputs[1:])
-    assert macd_inputs[0] is None and all(value is not None for value in macd_inputs[1:])
     assert max(overlap_lengths) == 20
 
     def fail_overlap(_window: object) -> float:
@@ -291,3 +282,73 @@ def test_supplied_builtin_name_cannot_mislabel_calculation(
         )
     assert response.status_code == 422
     assert "does not match the bundled" in response.json()["detail"]
+
+
+def test_supplied_builtin_same_spec_cannot_replace_its_calculator() -> None:
+    ema_definition = next(
+        definition
+        for definition in discover()
+        if any(spec.name == "ema_20" for spec in definition.specs)
+    )
+    spec = next(spec for spec in ema_definition.specs if spec.name == "ema_20")
+
+    def different_calculate(source: list[Bar]) -> FeatureTable:
+        return FeatureTable.from_columns(
+            (spec,),
+            [bar.time for bar in source],
+            {spec.name: [bar.close + 100 for bar in source]},
+        )
+
+    definition = FeatureDefinition((spec,), different_calculate, ())
+    with pytest.raises(FeatureExportError, match="does not match the bundled"):
+        build_feature_frame(bars(3), "EURUSD", "H1", ["ema_20"], (definition,))
+
+
+def test_dynamic_export_rejects_misaligned_feature_table() -> None:
+    spec = FeatureSpec("atr_10", "Float64", {"period": 10})
+
+    def misaligned_calculate(source: list[Bar]) -> FeatureTable:
+        return FeatureTable.from_columns(
+            (spec,),
+            [bar.time + 1 for bar in source],
+            {spec.name: [1.0 for _ in source]},
+        )
+
+    definition = FeatureDefinition((spec,), misaligned_calculate, ())
+    with pytest.raises(FeatureExportError, match="invalid table"):
+        build_feature_frame(bars(3), "EURUSD", "H1", ["atr_10"], (definition,))
+
+
+def test_selected_periods_drive_export_values_and_column_contract() -> None:
+    source = bars(150)
+    definitions = configure_features(
+        discover(),
+        {
+            "atr_period": 10,
+            "rsi_period": 7,
+            "ema_period": 9,
+            "rolling_overlap_period": 12,
+            "macd_fast_period": 5,
+            "macd_slow_period": 34,
+            "macd_signal_period": 6,
+        },
+    )
+    frame, specs = build_feature_frame(
+        source,
+        "EURUSD",
+        "H1",
+        ["atr_10", "candle_range_to_atr_10", "rsi_7", "macd_histogram_5_34_6"],
+        definitions,
+    )
+    contracts = {spec.name: spec.parameters for spec in specs}
+    assert contracts == {
+        "atr_10": {"period": 10},
+        "candle_range_to_atr_10": {"atr_period": 10},
+        "rsi_7": {"period": 7},
+        "macd_histogram_5_34_6": {"fast_period": 5, "slow_period": 34, "signal_period": 6},
+    }
+    assert frame["atr_10"].iloc[9] == pytest.approx(11.0)
+    assert frame["atr_10"].iloc[19] == pytest.approx(11.0)
+    assert frame["candle_range_to_atr_10"].iloc[19] == pytest.approx(1.0)
+    assert frame["rsi_7"].iloc[:7].isna().all()
+    assert frame["rsi_7"].iloc[7] == 100
