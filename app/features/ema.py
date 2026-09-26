@@ -42,7 +42,7 @@ def make_feature(period: int = DEFAULT_PERIOD) -> FeatureDefinition:
             FeatureViewSpec(
                 name,
                 name,
-                "EMA",
+                f"EMA {period}",
                 f"Price overlay, period {period}",
                 "line",
                 series_options={

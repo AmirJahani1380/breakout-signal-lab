@@ -65,7 +65,7 @@ def make_feature(period: int = DEFAULT_PERIOD) -> FeatureDefinition:
         FeatureViewSpec(
             name,
             name,
-            "ATR",
+            f"ATR {period}",
             f"Wilder average true range, period {period}",
             None,
             selection_key="atr",
@@ -73,7 +73,7 @@ def make_feature(period: int = DEFAULT_PERIOD) -> FeatureDefinition:
         FeatureViewSpec(
             f"{name}_pane",
             name,
-            "ATR pane",
+            f"ATR {period} pane",
             f"Wilder average true range, period {period}",
             "line",
             pane="separate",

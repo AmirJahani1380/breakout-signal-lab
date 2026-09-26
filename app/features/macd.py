@@ -94,7 +94,7 @@ def make_feature(
         FeatureViewSpec(
             macd.name,
             macd.name,
-            "MACD",
+            f"MACD {fast_period}/{slow_period}/{signal_period}",
             f"{fast_period}/{slow_period} EMA difference",
             "line",
             pane="separate",
@@ -115,7 +115,7 @@ def make_feature(
         FeatureViewSpec(
             signal.name,
             signal.name,
-            "MACD signal",
+            f"MACD {fast_period}/{slow_period}/{signal_period} signal",
             f"{signal_period}-period signal EMA",
             "line",
             pane="separate",
@@ -126,7 +126,7 @@ def make_feature(
         FeatureViewSpec(
             hist.name,
             hist.name,
-            "MACD histogram",
+            f"MACD {fast_period}/{slow_period}/{signal_period} histogram",
             f"{fast_period}/{slow_period} EMA difference minus its "
             f"{signal_period}-period signal EMA",
             "histogram",

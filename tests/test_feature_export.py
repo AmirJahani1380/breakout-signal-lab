@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from pathlib import Path
 
 import pandas as pd
@@ -61,64 +62,6 @@ def test_every_builtin_feature_matches_full_history_calculation() -> None:
             )
 
 
-def test_export_calculates_from_prior_bar_state(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from app import feature_export
-
-    updates: list[float | None] = []
-    original_ema = feature_export._ema
-
-    def track_ema(previous: float | None, current: float, period: int) -> float:
-        if period == 20:
-            updates.append(previous)
-        return original_ema(previous, current, period)
-
-    monkeypatch.setattr(feature_export, "_ema", track_ema)
-    atr_inputs: list[float | None] = []
-    rsi_inputs: list[float | None] = []
-    overlap_lengths: list[int] = []
-    original_atr = feature_export.AtrState.add
-    original_rsi = feature_export.RsiState.add
-    original_overlap = feature_export.overlap_score
-
-    def track_atr(state: feature_export.AtrState, bar: Bar) -> float | None:
-        atr_inputs.append(state.previous_close)
-        return original_atr(state, bar)
-
-    def track_rsi(state: feature_export.RsiState, close: float) -> float | None:
-        rsi_inputs.append(state.previous_close)
-        return original_rsi(state, close)
-
-    def track_overlap(window: object) -> float | None:
-        assert isinstance(window, tuple)
-        overlap_lengths.append(len(window))
-        return original_overlap(window)
-
-    monkeypatch.setattr(feature_export.AtrState, "add", track_atr)
-    monkeypatch.setattr(feature_export.RsiState, "add", track_rsi)
-    monkeypatch.setattr(feature_export, "overlap_score", track_overlap)
-    build_feature_frame(
-        bars(200),
-        "EURUSD",
-        "H1",
-        ["ema_20", "macd_histogram_12_26_9", "atr_20", "rsi_14", "rolling_overlap_20"],
-    )
-    assert len(updates) == 200
-    assert updates[0] is None and all(value is not None for value in updates[1:])
-    assert len(atr_inputs) == len(rsi_inputs) == len(overlap_lengths) == 200
-    assert atr_inputs[0] is rsi_inputs[0] is None
-    assert all(value is not None for value in atr_inputs[1:] + rsi_inputs[1:])
-    assert max(overlap_lengths) == 20
-
-    def fail_overlap(_window: object) -> float:
-        raise RuntimeError("overlap broke")
-
-    monkeypatch.setattr(feature_export, "overlap_score", fail_overlap)
-    with pytest.raises(FeatureExportError, match="overlap broke"):
-        build_feature_frame(bars(21), "EURUSD", "H1", ["rolling_overlap_20"])
-
-
 def test_export_round_trips_metadata_and_refuses_overwrite(tmp_path: Path) -> None:
     source = write_csv(
         tmp_path / "EURUSD_H1.csv",
@@ -177,7 +120,7 @@ def test_missing_failure_and_empty_dataset(tmp_path: Path) -> None:
     spec = FeatureSpec("custom", "Float64")
 
     def calculate_custom(source: object) -> FeatureTable:
-        assert isinstance(source, tuple)
+        assert isinstance(source, Sequence)
         return FeatureTable.from_columns((spec,), [bar.time for bar in source], {"custom": [1.25]})
 
     definition = FeatureDefinition((spec,), calculate_custom, ())
@@ -235,32 +178,6 @@ def test_api_rejects_wrong_calculator_contract(
     assert "do not match the registered definition" in response.json()["detail"]
 
 
-def test_api_reports_dtype_conversion_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from app import feature_export
-
-    source_root = tmp_path / "market"
-    source_root.mkdir()
-    write_csv(source_root / "EURUSD_H1.csv", [(100, 2, 3, 0, 1, 10)])
-    original_add = feature_export._BarFeatureState.add
-
-    def invalid_value(
-        state: feature_export._BarFeatureState, bar: Bar, selected: frozenset[str]
-    ) -> dict[str, object]:
-        values = original_add(state, bar, selected)
-        values["candle_direction"] = "invalid"
-        return values
-
-    monkeypatch.setattr(feature_export._BarFeatureState, "add", invalid_value)
-    with TestClient(create_app(Settings(source_root))) as client:
-        response = client.get(
-            "/api/v1/export?symbol=EURUSD&timeframe=H1&features=candle_direction&format=csv"
-        )
-    assert response.status_code == 422
-    assert "cannot convert selected feature values" in response.json()["detail"]
-
-
 def test_supplied_builtin_name_cannot_mislabel_calculation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -315,7 +232,7 @@ def test_dynamic_export_rejects_misaligned_feature_table() -> None:
         )
 
     definition = FeatureDefinition((spec,), misaligned_calculate, ())
-    with pytest.raises(FeatureExportError, match="invalid table"):
+    with pytest.raises(FeatureExportError, match="timestamp-aligned FeatureTable"):
         build_feature_frame(bars(3), "EURUSD", "H1", ["atr_10"], (definition,))
 
 

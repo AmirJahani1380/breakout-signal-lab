@@ -78,16 +78,16 @@ def test_period_settings_change_specs_labels_and_calculated_values() -> None:
     }
     assert configured[4].specs[1].parameters == configured[4].specs[0].parameters
     assert [view.label for view in configured[4].views] == [
-        "MACD",
-        "MACD signal",
-        "MACD histogram",
+        "MACD 5/34/6",
+        "MACD 5/34/6 signal",
+        "MACD 5/34/6 histogram",
     ]
     assert "5/34" in configured[4].views[0].description
     assert "6-period" in configured[4].views[1].description
     assert "6-period" in configured[4].views[2].description
     relative = make_normalized_feature(10)
     atr_view = next(view for view in relative.views if view.identifier == "candle_range_to_atr_10")
-    assert atr_view.label == "Candle Range To Atr"
+    assert atr_view.label == "Candle Range To Atr 10"
     assert atr_view.selection_key == "candle_range_to_atr"
 
 

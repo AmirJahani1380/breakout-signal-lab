@@ -72,7 +72,7 @@ def make_feature(period: int = DEFAULT_PERIOD) -> FeatureDefinition:
             FeatureViewSpec(
                 name,
                 name,
-                "RSI",
+                f"RSI {period}",
                 f"Separate 0–100 pane, period {period}",
                 "line",
                 pane="separate",

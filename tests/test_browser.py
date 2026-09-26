@@ -4,6 +4,7 @@ import json
 from io import StringIO
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+from zipfile import ZipFile
 
 import pandas as pd
 import pytest
@@ -81,6 +82,63 @@ def test_stored_paging_visibility_and_selection_preserve_values(
     page.locator("#data-mode").select_option("source")
     assert page.locator("#export-tab").is_enabled()
     assert page.locator("#export-features input").count() == original_export_count
+
+
+def test_calculated_periods_survive_viewing_stored_chart_and_export(
+    page: Page, viewer_url: str
+) -> None:
+    page.goto(viewer_url)
+    page.get_by_role("tab", name="Indicators").click()
+    ema_period = page.locator('[data-indicator="ema_20"] [data-period="ema_period"]')
+    ema_period.fill("12")
+    ema_period.press("Tab")
+    page.locator('[data-indicator="ema_12"]').wait_for()
+    atr_period = page.locator('[data-indicator="atr_20"] [data-period="atr_period"]')
+    atr_period.fill("15")
+    atr_period.press("Tab")
+    page.locator('[data-indicator="atr_15"]').wait_for()
+
+    page.locator("#data-mode").select_option("stored")
+    page.locator("#symbol").select_option("XAUUSDzero")
+    page.get_by_role("button", name="D1").click()
+    page.wait_for_function("document.querySelector('#chart').dataset.barCount === '3'")
+    assert page.locator("[data-period]").count() == 0
+
+    page.locator("#data-mode").select_option("source")
+    page.locator('[data-indicator="ema_12"]').wait_for()
+    page.locator('[data-indicator="atr_15"]').wait_for()
+    assert (
+        page.locator('[data-indicator="ema_12"] [data-period="ema_period"]').input_value() == "12"
+    )
+    assert (
+        page.locator('[data-indicator="atr_15"] [data-period="atr_period"]').input_value() == "15"
+    )
+    page.locator("#symbol").select_option("EURUSD")
+    with page.expect_request(
+        lambda request: (
+            "/api/v1/bars?" in request.url
+            and parse_qs(urlparse(request.url).query).get("ema_period") == ["12"]
+            and parse_qs(urlparse(request.url).query).get("atr_period") == ["15"]
+        )
+    ):
+        page.get_by_role("button", name="H1").click()
+    page.wait_for_function("document.querySelector('#chart').dataset.barCount === '1000'")
+
+    page.get_by_role("tab", name="Export").click()
+    for checkbox in page.locator("#export-features input").all():
+        checkbox.uncheck()
+    page.locator('#export-features input[value="ema_12"]').check()
+    page.locator('#export-features input[value="atr_15"]').check()
+    with page.expect_download() as downloaded:
+        page.get_by_role("button", name="Download CSV").click()
+    with ZipFile(downloaded.value.path()) as archive:
+        columns = archive.read("bar_features.csv").decode().splitlines()[0].split(",")
+        metadata = json.loads(archive.read("bar_features.csv.json"))
+    assert set(columns[-2:]) == {"ema_12", "atr_15"}
+    assert {feature["name"]: feature["parameters"] for feature in metadata["features"]} == {
+        "ema_12": {"period": 12},
+        "atr_15": {"period": 15},
+    }
 
 
 def test_stale_stored_catalog_response_cannot_replace_calculated_mode(
@@ -686,7 +744,13 @@ def test_marker_renderer_draws_markers_without_adding_a_line_series(
 
     def respond(route: object) -> None:
         query = parse_qs(urlparse(route.request.url).query)  # type: ignore[attr-defined]
-        indicators = [] if query.get("atr_period") == ["10"] else [marker]
+        indicators = [
+            indicator
+            for indicator in route.fetch().json()["indicators"]  # type: ignore[attr-defined]
+            if indicator["id"] in {"atr_20", "atr_10"}
+        ]
+        if query.get("atr_period") != ["10"]:
+            indicators.append(marker)
         route.fulfill(  # type: ignore[attr-defined]
             json={
                 "bars": bars,
@@ -712,7 +776,8 @@ def test_marker_renderer_draws_markers_without_adding_a_line_series(
             return false;
         })"""
     )
-    period = page.locator('[data-period="atr_period"]')
+    page.get_by_role("tab", name="Indicators").click()
+    period = page.locator('[data-period="atr_period"]').first
     period.fill("10")
     period.press("Tab")
     page.wait_for_function("document.querySelector('#chart').dataset.markerCount === '0'")
@@ -753,10 +818,11 @@ def test_period_change_keeps_numbered_custom_export_columns_distinct(
         checkbox.uncheck()
     page.locator('#export-features input[value="score_1"]').check()
     page.locator('#export-features input[value="atr_10_custom"]').check()
-    period = page.locator('[data-period="atr_period"]')
+    page.get_by_role("tab", name="Indicators").click()
+    period = page.locator('[data-indicator="atr_20"] [data-period="atr_period"]')
     period.fill("10")
     period.press("Tab")
-    page.locator('#export-features input[value="atr_10"]').wait_for()
+    page.locator('#export-features input[value="atr_10"]').wait_for(state="attached")
     assert page.locator("#export-features input:checked").evaluate_all(
         "inputs => inputs.map(input => input.value)"
     ) == ["score_1", "atr_10_custom"]
@@ -787,7 +853,7 @@ def test_rapid_period_changes_ignore_stale_catalog_completions(page: Page, viewe
 
     page.route("**/api/v1/catalog**", hold_catalog)
     baseline_bar_requests = len(bar_requests)
-    period = page.locator('[data-period="atr_period"]')
+    period = page.locator('[data-period="atr_period"]').first
     with page.expect_request("**/api/v1/catalog**"):
         period.fill("10")
         period.press("Tab")
@@ -823,14 +889,14 @@ def test_rapid_period_changes_ignore_stale_catalog_completions(page: Page, viewe
 
 def test_period_setting_updates_chart_and_export_feature_names(page: Page, viewer_url: str) -> None:
     page.goto(viewer_url)
-    period = page.locator('[data-period="atr_period"]')
+    page.get_by_role("tab", name="Indicators").click()
+    period = page.locator('[data-indicator="atr_20"] [data-period="atr_period"]')
     period.fill("10")
     period.press("Tab")
     page.wait_for_function("document.querySelector('[data-indicator=atr_10]')")
     page.locator("#symbol").select_option("EURUSD")
     page.get_by_role("button", name="H1").click()
     page.wait_for_function("document.querySelector('#chart').dataset.barCount === '1000'")
-    page.get_by_role("tab", name="Indicators").click()
     assert page.locator('[data-indicator="atr_10"]').count() == 1
     assert page.locator('[data-indicator="atr_20"]').count() == 0
     page.locator('[data-indicator="atr_10"] [data-apply]').check()
@@ -852,8 +918,10 @@ def test_period_setting_updates_chart_and_export_feature_names(page: Page, viewe
     for checkbox in page.locator("#export-features input").all():
         checkbox.uncheck()
     page.locator('#export-features input[value="atr_10"]').check()
-    period.fill("11")
-    period.press("Tab")
+    page.get_by_role("tab", name="Indicators").click()
+    next_period = page.locator('[data-indicator="atr_10"] [data-period="atr_period"]')
+    next_period.fill("11")
+    next_period.press("Tab")
     page.wait_for_function("document.querySelector('#export-features input[value=atr_11]')")
     assert page.locator('[data-indicator="atr_11"] [data-apply]').is_checked()
     assert (
@@ -879,6 +947,7 @@ def test_period_setting_updates_chart_and_export_feature_names(page: Page, viewe
         )
 
     page.route("**/api/v1/export**", capture_export)
+    page.get_by_role("tab", name="Export").click()
     with page.expect_download():
         page.get_by_role("button", name="Download CSV").click()
     assert len(export_requests) == 1
@@ -893,7 +962,7 @@ def test_new_feature_setting_renders_and_reaches_chart_and_export(
 ) -> None:
     def add_setting(route: object) -> None:
         payload = route.fetch().json()  # type: ignore[attr-defined]
-        payload["settings"].append(
+        payload["indicators"][0]["settings"].append(
             {
                 "key": "custom_period",
                 "label": "Custom period",
@@ -905,7 +974,9 @@ def test_new_feature_setting_renders_and_reaches_chart_and_export(
         route.fulfill(json=payload)  # type: ignore[attr-defined]
 
     page.route("**/api/v1/features**", add_setting)
+    page.route("**/api/v1/bars**", add_setting)
     select_timeframe(page, viewer_url)
+    page.get_by_role("tab", name="Indicators").click()
     custom = page.locator('[data-period="custom_period"]')
     assert custom.input_value() == "3"
     with page.expect_request(

@@ -13,7 +13,6 @@ const indicatorsPanelElement = document.querySelector("#indicators-panel");
 const exportTabElement = document.querySelector("#export-tab");
 const exportPanelElement = document.querySelector("#export-panel");
 const exportFeaturesElement = document.querySelector("#export-features");
-const indicatorSettingsElement = document.querySelector("#indicator-settings");
 const exportStatusElement = document.querySelector("#export-status");
 const exportCsvElement = document.querySelector("#export-csv");
 const exportParquetElement = document.querySelector("#export-parquet");
@@ -41,7 +40,6 @@ if (
   !(exportTabElement instanceof HTMLButtonElement) ||
   !(exportPanelElement instanceof HTMLElement) ||
   !(exportFeaturesElement instanceof HTMLElement) ||
-  !(indicatorSettingsElement instanceof HTMLFieldSetElement) ||
   !(exportStatusElement instanceof HTMLElement) ||
   !(exportCsvElement instanceof HTMLButtonElement) ||
   !(exportParquetElement instanceof HTMLButtonElement) ||
@@ -66,9 +64,10 @@ const indicatorsPanel = indicatorsPanelElement;
 const exportTab = exportTabElement;
 const exportPanel = exportPanelElement;
 const exportFeatures = exportFeaturesElement;
-const indicatorSettings = indicatorSettingsElement;
 /** @type {HTMLInputElement[]} */
 let settingInputs = [];
+/** @type {Map<string, string>} */
+const selectedPeriods = new Map();
 const exportStatus = exportStatusElement;
 const exportCsv = exportCsvElement;
 const exportParquet = exportParquetElement;
@@ -130,7 +129,8 @@ const candles = chart.addSeries(LightweightCharts.CandlestickSeries, {
  * series_options:Record<string, any>, price_scale_options:Record<string, any>,
  * pane_height:number|null, scale_range:[number, number]|null,
  * reference_lines:Array<Record<string, any>>, points:IndicatorPoint[],
- * values:Array<{time:number,value:number|boolean}>}} IndicatorDefinition
+ * values:Array<{time:number,value:number|boolean}>,
+ * settings:Array<{key:string,label:string,default:number,minimum:number,maximum:number}>}} IndicatorDefinition
  */
 
 /** @type {IndicatorDefinition[]} */
@@ -299,6 +299,7 @@ function toggleIndicatorVisibility(identifier) {
 }
 
 function renderIndicatorList() {
+  settingInputs = [];
   indicatorsPanel.replaceChildren();
   if (!indicatorDefinitions.length) {
     indicatorsPanel.textContent = "No indicators available.";
@@ -331,7 +332,27 @@ function renderIndicatorList() {
     );
     const status = document.createElement("span");
     status.dataset.indicatorState = "";
+    const settings = document.createElement("div");
+    settings.className = "indicator-settings";
+    for (const setting of definition.settings ?? []) {
+      const settingLabel = document.createElement("label");
+      settingLabel.textContent = setting.label;
+      const input = document.createElement("input");
+      input.type = "number";
+      input.min = String(setting.minimum);
+      input.max = String(setting.maximum);
+      input.step = "1";
+      if (!selectedPeriods.has(setting.key))
+        selectedPeriods.set(setting.key, String(setting.default));
+      input.value = selectedPeriods.get(setting.key) ?? String(setting.default);
+      input.dataset.period = setting.key;
+      input.addEventListener("change", onSettingChange);
+      settingLabel.append(input);
+      settings.append(settingLabel);
+      settingInputs.push(input);
+    }
     row.append(heading, applyLabel, visibility, status);
+    if (settings.childElementCount) row.append(settings);
     indicatorsPanel.append(row);
     renderIndicatorState(definition.id);
   }
@@ -420,35 +441,7 @@ function addEnabledFeatures(url) {
 }
 
 function addPeriods(url) {
-  for (const input of settingInputs)
-    url.searchParams.set(input.dataset.period, input.value);
-}
-
-/** @param {Array<{key:string,label:string,default:number,minimum:number,maximum:number}>} settings */
-function renderSettings(settings) {
-  const previous = new Map(
-    settingInputs.map((input) => [input.dataset.period, input.value]),
-  );
-  const legend = document.createElement("legend");
-  legend.textContent = "Indicator settings";
-  indicatorSettings.replaceChildren(legend);
-  settingInputs = [];
-  indicatorSettings.hidden = settings.length === 0;
-  for (const setting of settings) {
-    const label = document.createElement("label");
-    label.textContent = setting.label;
-    const input = document.createElement("input");
-    input.type = "number";
-    input.min = String(setting.minimum);
-    input.max = String(setting.maximum);
-    input.step = "1";
-    input.value = previous.get(setting.key) ?? String(setting.default);
-    input.dataset.period = setting.key;
-    input.addEventListener("change", onSettingChange);
-    label.append(input);
-    indicatorSettings.append(label);
-    settingInputs.push(input);
-  }
+  for (const [key, value] of selectedPeriods) url.searchParams.set(key, value);
 }
 
 /** @param {number} version */
@@ -695,7 +688,6 @@ async function loadCatalog(previousStates = new Map()) {
     const featurePayload = await featureResponse.json();
     if (requestVersion !== selectionVersion || requestedMode !== dataMode.value)
       return false;
-    renderSettings(featurePayload.settings ?? []);
     for (const definition of featurePayload.indicators ?? []) {
       const previousState = previousStates.get(
         definition.selection_key ?? definition.id,
@@ -942,7 +934,14 @@ async function downloadFeatures(format) {
 exportCsv.addEventListener("click", () => void downloadFeatures("csv"));
 exportParquet.addEventListener("click", () => void downloadFeatures("parquet"));
 
-function onSettingChange() {
+/** @param {Event} event */
+function onSettingChange(event) {
+  const changed = /** @type {HTMLInputElement} */ (event.currentTarget);
+  if (!changed.reportValidity()) return;
+  selectedPeriods.set(changed.dataset.period, changed.value);
+  for (const input of settingInputs)
+    if (input.dataset.period === changed.dataset.period)
+      input.value = changed.value;
   const previous = activeSelection ?? pendingPeriodSelection;
   pendingPeriodSelection = previous;
   /** @type {Map<string, IndicatorState>} */

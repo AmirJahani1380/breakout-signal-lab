@@ -66,7 +66,8 @@ def make_feature(atr_period: int = DEFAULT_ATR_PERIOD) -> FeatureDefinition:
         FeatureViewSpec(
             spec.name,
             spec.name,
-            (spec.selection_key or spec.name).replace("_", " ").title(),
+            (spec.selection_key or spec.name).replace("_", " ").title()
+            + (f" {atr_period}" if spec.parameters else ""),
             spec.name.replace("_to_", " divided by ").replace("_", " "),
             None,
             selection_key=spec.selection_key,

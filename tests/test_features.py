@@ -165,6 +165,43 @@ def test_builtin_discovery_has_no_spurious_infrastructure_warning(
     assert "Skipping feature module" not in caplog.text
 
 
+def test_new_feature_file_supplies_chart_and_export_without_registration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import app.features as features
+    from app.feature_export import build_feature_frame
+
+    (tmp_path / "file_only_signal.py").write_text(
+        """from app.features import FeatureDefinition, FeatureSpec, FeatureTable, FeatureViewSpec
+
+spec = FeatureSpec("file_only_signal", "Float64")
+
+def calculate(bars):
+    total = 0.0
+    values = []
+    for bar in bars:
+        total += bar.close
+        values.append(total)
+    return FeatureTable.from_columns((spec,), [bar.time for bar in bars], {spec.name: values})
+
+feature = FeatureDefinition(
+    (spec,), calculate,
+    (FeatureViewSpec(spec.name, spec.name, "Cumulative close", "Sum of closes", "line"),),
+)
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(features, "__path__", [*features.__path__, str(tmp_path)])
+    definition = next(
+        definition for definition in discover() if definition.specs[0].name == "file_only_signal"
+    )
+    source = bars([1, 2, 3])
+    chart_view = definition.views[0].definition(definition.calculate(source))
+    exported, _ = build_feature_frame(source, "EURUSD", "H1", ["file_only_signal"])
+    assert [point["value"] for point in chart_view["points"]] == [1.0, 3.0, 6.0]
+    assert exported["file_only_signal"].tolist() == [1.0, 3.0, 6.0]
+
+
 def test_marker_and_separate_pane_map_to_distinct_rendering_paths() -> None:
     spec = FeatureSpec("signal_price", "Float64")
     table = FeatureTable.from_columns((spec,), [1], {spec.name: [2.5]})

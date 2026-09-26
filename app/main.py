@@ -26,7 +26,13 @@ from .bars import (
     load_bars,
 )
 from .feature_export import FeatureExportError, export_bar_features
-from .features import FeatureDefinition, FeatureTable, calculate_requested, discover
+from .features import (
+    FeatureDefinition,
+    FeatureTable,
+    FeatureViewSpec,
+    calculate_requested,
+    discover,
+)
 from .features.configuration import configure_features, configure_stored_features, settings_catalog
 from .stored_data import StoredDataError, StoredDataset, load_stored_dataset
 
@@ -282,11 +288,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 {spec.name: () for spec in definition.specs},
             )
             for view in definition.views:
-                feature_payload.append(
+                payload_view = (
                     view.definition(table, display_times)
                     if table is not None and view in selected_views
                     else view.definition(empty_table)
                 )
+                payload_view["settings"] = _view_settings(definition, view)
+                feature_payload.append(payload_view)
         payload: dict[str, object] = {
             "bars": [bar.as_dict() for bar in display_bars],
             "indicators": feature_payload,
@@ -311,8 +319,22 @@ def _empty_feature_payload(
         empty_table = FeatureTable.from_columns(
             definition.specs, (), {spec.name: () for spec in definition.specs}
         )
-        payload.extend(view.definition(empty_table) for view in definition.views)
+        for view in definition.views:
+            payload_view = view.definition(empty_table)
+            payload_view["settings"] = _view_settings(definition, view)
+            payload.append(payload_view)
     return payload
+
+
+def _view_settings(definition: FeatureDefinition, view: FeatureViewSpec) -> list[dict[str, object]]:
+    parameters = next(
+        spec.parameters for spec in definition.specs if spec.name == view.feature_name
+    )
+    return [
+        setting.as_dict()
+        for setting in definition.settings
+        if any(name in parameters for name in setting.parameters)
+    ]
 
 
 app = create_app()

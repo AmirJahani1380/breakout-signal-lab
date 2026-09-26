@@ -1,31 +1,20 @@
-"""Chronological, stateful export of canonical bars and selected feature columns."""
+"""Chronological export of canonical bars and selected feature columns."""
 
 from __future__ import annotations
 
 import hashlib
 import json
-from collections import deque
 from collections.abc import Sequence
+from itertools import pairwise
 from math import isfinite
 from pathlib import Path
 from typing import Literal
 
 import pandas as pd
+from pandas.api.extensions import ExtensionArray
 
 from app.bars import Bar, load_bars
-from app.features import (
-    FeatureDefinition,
-    FeatureSpec,
-    FeatureTable,
-    calculate_requested,
-    discover,
-)
-from app.features.atr import AtrState
-from app.features.candle_measurements import measure_candles
-from app.features.ema import ema_step as _ema
-from app.features.is_engulfing import _engulfs
-from app.features.rolling_overlap import overlap_score
-from app.features.rsi import RsiState
+from app.features import FeatureDefinition, FeatureSpec, FeatureTable, discover
 
 
 class FeatureExportError(ValueError):
@@ -50,77 +39,6 @@ def _selected_warm_up(
     )
 
 
-class _BarFeatureState:
-    def __init__(self) -> None:
-        self.previous: Bar | None = None
-        self.previous_bars: deque[Bar] = deque(maxlen=20)
-        self.ema_20: float | None = None
-        self.atr = AtrState()
-        self.rsi = RsiState()
-
-    def add(self, bar: Bar, selected: frozenset[str]) -> dict[str, float | int | bool | None]:
-        # Dataset-start seed: first close for EMAs, first high-low for ATR, and
-        # the first 14 close changes for RSI. State advances exactly once per bar.
-        measured = measure_candles((bar,))
-        candle_range = measured.candle_range[0]
-        body_size = measured.body_size[0]
-        upper_wick = measured.upper_wick[0]
-        lower_wick = measured.lower_wick[0]
-        if "ema_20" in selected:
-            self.ema_20 = _ema(self.ema_20, bar.close, 20)
-        atr: float | None = None
-        if (
-            "atr_20" in selected
-            or "atr_20_to_close" in selected
-            or any(name.endswith("_to_atr_20") for name in selected)
-        ):
-            atr = self.atr.add(bar)
-        rsi = self.rsi.add(bar.close) if "rsi_14" in selected else None
-        overlap = (
-            overlap_score(tuple(self.previous_bars))
-            if "rolling_overlap_20" in selected or "rolling_overlap_20_above_half" in selected
-            else None
-        )
-        values: dict[str, float | int | bool | None] = {
-            "candle_range": candle_range,
-            "body_size": body_size,
-            "upper_wick_size": upper_wick,
-            "lower_wick_size": lower_wick,
-            "body_to_range_ratio": body_size / candle_range if candle_range else 0.0,
-            "candle_direction": (bar.close > bar.open) - (bar.close < bar.open),
-            "is_engulfing": _engulfs(self.previous, bar) if self.previous else False,
-            "volume": bar.volume,
-            "volume_up": bar.close >= bar.open,
-            "ema_20": self.ema_20,
-            "rsi_14": rsi,
-            "atr_20": atr,
-            "rolling_overlap_20": overlap,
-            "rolling_overlap_20_above_half": None
-            if overlap is None or overlap == 0.5
-            else overlap > 0.5,
-        }
-        numerators = {
-            "candle_range": candle_range,
-            "body_size": body_size,
-            "upper_wick": upper_wick,
-            "lower_wick": lower_wick,
-            "atr_20": atr,
-        }
-        for name in selected:
-            if "_to_" in name and name not in values:
-                numerator_name, denominator_name = name.rsplit("_to_", 1)
-                numerator = numerators[numerator_name]
-                denominator = atr if denominator_name == "atr_20" else bar.close
-                values[name] = (
-                    numerator / denominator
-                    if numerator is not None and denominator is not None and denominator != 0
-                    else None
-                )
-        self.previous_bars.append(bar)
-        self.previous = bar
-        return {name: values[name] for name in selected}
-
-
 def build_feature_frame(
     bars: Sequence[Bar],
     asset: str,
@@ -128,9 +46,8 @@ def build_feature_frame(
     feature_names: Sequence[str],
     definitions: Sequence[FeatureDefinition] | None = None,
 ) -> tuple[pd.DataFrame, tuple[FeatureSpec, ...]]:
-    """Calculate each selected column in one chronological pass over the bars."""
-    bundled = discover()
-    registered = definitions if definitions is not None else bundled
+    """Calculate selected columns from each registered feature's full-history calculator."""
+    registered = definitions if definitions is not None else discover()
     specs = {spec.name: spec for definition in registered for spec in definition.specs}
     if not feature_names or len(feature_names) != len(set(feature_names)):
         raise FeatureExportError("select one or more unique feature columns")
@@ -139,136 +56,52 @@ def build_feature_frame(
         raise FeatureExportError(f"unknown feature columns: {sorted(missing)!r}")
     if set(feature_names) & {"asset", "timeframe", "time", "open", "high", "low", "close"}:
         raise FeatureExportError("selected features conflict with canonical columns")
+    if any(later.time <= earlier.time for earlier, later in pairwise(bars)):
+        raise FeatureExportError("bars must have unique, chronological timestamps")
+
+    bundled = {spec.name: definition for definition in discover() for spec in definition.specs}
     selected = frozenset(feature_names)
-    bundled_definitions = {
-        spec.name: definition for definition in bundled for spec in definition.specs
-    }
+    columns: dict[str, ExtensionArray] = {}
     for definition in registered:
-        for spec in definition.specs:
-            if (
-                spec.name in selected
-                and spec.name in bundled_definitions
-                and definition is not bundled_definitions[spec.name]
-            ):
+        names = selected & {spec.name for spec in definition.specs}
+        if not names:
+            continue
+        for name in names:
+            if name in bundled and definition is not bundled[name]:
                 raise FeatureExportError(
-                    f"{spec.name}: supplied definition does not match "
-                    "the bundled incremental calculator"
+                    f"{name}: supplied definition does not match the bundled calculator"
                 )
-    dynamic_names = {
-        spec.name
-        for definition in registered
-        for spec in definition.specs
-        if spec.name in selected
-        and (spec.parameters or spec.warm_up or definition.calculation_warm_up)
-        and spec.name not in {"ema_20", "rsi_14", "atr_20", "rolling_overlap_20"}
-    }
-    precomputed: dict[str, list[object]] = {}
-    for definition in registered:
-        selected_dynamic = dynamic_names & {spec.name for spec in definition.specs}
-        if selected_dynamic:
-            calculation_names = (
-                frozenset(selected_dynamic)
-                if definition.calculate_selected is not None
-                else frozenset(spec.name for spec in definition.specs)
-            )
-            table = calculate_requested(definition, bars, calculation_names)
-            if table is None:
-                raise FeatureExportError(
-                    f"selected feature calculator returned an invalid table: "
-                    f"{sorted(selected_dynamic)!r}"
-                )
-            precomputed.update({name: table.frame[name].tolist() for name in selected_dynamic})
-    built_in = {
-        "candle_range",
-        "body_size",
-        "upper_wick_size",
-        "lower_wick_size",
-        "body_to_range_ratio",
-        "candle_direction",
-        "is_engulfing",
-        "volume",
-        "volume_up",
-        "ema_20",
-        "rsi_14",
-        "atr_20",
-        "rolling_overlap_20",
-        "rolling_overlap_20_above_half",
-    }
-    built_in.update(
-        name
-        for name in selected
-        if name in specs
-        and name.rsplit("_to_", 1)[0]
-        in {"candle_range", "body_size", "upper_wick", "lower_wick", "atr_20"}
-        and name.rsplit("_to_", 1)[-1] in {"atr_20", "close"}
-    )
-    built_in.update(dynamic_names)
-    custom_definitions: list[tuple[FeatureDefinition, frozenset[str]]] = []
-    for definition in registered:
-        custom_names = (selected - built_in) & {spec.name for spec in definition.specs}
-        if custom_names:
-            if definition.calculation_warm_up or any(
-                spec.warm_up for spec in definition.specs if spec.name in custom_names
-            ):
-                raise FeatureExportError(
-                    f"no incremental calculator for feature columns: {sorted(custom_names)!r}"
-                )
-            custom_definitions.append((definition, frozenset(custom_names)))
-    state = _BarFeatureState()
-    rows: list[dict[str, object]] = []
-    prior_time: int | None = None
-    for row_index, bar in enumerate(bars):
-        if prior_time is not None and bar.time <= prior_time:
-            raise FeatureExportError("bars must have unique, chronological timestamps")
         try:
-            values: dict[str, object] = {
-                **state.add(bar, (selected & built_in) - dynamic_names),
-                **{name: column[row_index] for name, column in precomputed.items()},
-            }
-            for definition, names in custom_definitions:
-                table = (
-                    definition.calculate_selected((bar,), names)
-                    if definition.calculate_selected is not None
-                    else definition.calculate((bar,))
-                )
-                if not isinstance(table, FeatureTable) or table.timestamps != (bar.time,):
-                    raise ValueError("calculation must return one timestamp-aligned FeatureTable")
-                expected_specs = (
-                    tuple(spec for spec in definition.specs if spec.name in names)
-                    if definition.calculate_selected is not None
-                    else definition.specs
-                )
-                if table.specs != expected_specs:
-                    raise ValueError(
-                        f"calculated specs for {sorted(names)!r} "
-                        "do not match the registered definition"
-                    )
-                if not names <= set(table.frame.columns):
-                    raise ValueError(
-                        f"calculation omitted {sorted(names - set(table.frame.columns))!r}"
-                    )
-                values.update({name: table.frame.iloc[0][name] for name in names})
+            table = (
+                definition.calculate_selected(bars, names)
+                if definition.calculate_selected is not None
+                else definition.calculate(bars)
+            )
+            if not isinstance(table, FeatureTable) or table.timestamps != tuple(
+                bar.time for bar in bars
+            ):
+                raise ValueError("calculation must return a timestamp-aligned FeatureTable")
+            expected_specs = (
+                tuple(spec for spec in definition.specs if spec.name in names)
+                if definition.calculate_selected is not None
+                else definition.specs
+            )
+            if table.specs != expected_specs:
+                raise ValueError("calculated specs do not match the registered definition")
+            columns.update({name: table.frame[name].array for name in names})
         except Exception as error:
             raise FeatureExportError(
-                f"feature calculation failed for {list(feature_names)!r} at {bar.time}: {error}"
+                f"feature calculation failed for {sorted(names)!r}: {error}"
             ) from error
-        rows.append(
-            {"asset": asset, "timeframe": timeframe, "time": bar.time, **bar.as_dict(), **values}
-        )
-        prior_time = bar.time
-    columns = [
-        "asset",
-        "timeframe",
-        "time",
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        *(name for name in feature_names if name != "volume"),
-    ]
+
+    frame = pd.DataFrame.from_records(
+        [{"asset": asset, "timeframe": timeframe, **bar.as_dict()} for bar in bars],
+        columns=["asset", "timeframe", "time", "open", "high", "low", "close", "volume"],
+    )
     try:
-        frame = pd.DataFrame.from_records(rows, columns=columns)
+        for name, values in columns.items():
+            if name != "volume":
+                frame[name] = values
         frame = frame.astype(
             {
                 "asset": "string",
@@ -288,7 +121,19 @@ def build_feature_frame(
             isfinite(float(value)) for value in frame[spec.name].dropna()
         ):
             raise FeatureExportError(f"{spec.name} calculation produced non-finite values")
-    return frame, tuple(specs[name] for name in feature_names)
+    return frame[
+        [
+            "asset",
+            "timeframe",
+            "time",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            *(name for name in feature_names if name != "volume"),
+        ]
+    ], tuple(specs[name] for name in feature_names)
 
 
 def export_bar_features(

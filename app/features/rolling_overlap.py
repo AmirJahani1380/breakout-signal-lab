@@ -78,7 +78,7 @@ def make_feature(period: int = DEFAULT_PERIOD) -> FeatureDefinition:
     view = FeatureViewSpec(
         name,
         name,
-        "Rolling overlap",
+        f"Rolling overlap {period}",
         f"Shared range coverage of the previous {period} completed candles (0 to 1)",
         "histogram",
         pane="separate",

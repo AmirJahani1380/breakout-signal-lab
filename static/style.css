@@ -61,10 +61,24 @@ header {
 }
 .indicator {
   display: grid;
-  grid-template-columns: minmax(140px, 1fr) auto auto minmax(110px, auto);
+  grid-template-columns: minmax(100px, 1fr) auto auto minmax(110px, auto);
   align-items: center;
   gap: 12px;
   padding: 8px;
+}
+.indicator-settings {
+  display: flex;
+  flex-wrap: wrap;
+  grid-column: 1 / -1;
+  grid-row: 2;
+  gap: 6px;
+}
+.indicator-settings label {
+  display: grid;
+  font-size: 12px;
+}
+.indicator-settings input {
+  width: 48px;
 }
 .indicator + .indicator {
   border-top: 1px solid #363a45;

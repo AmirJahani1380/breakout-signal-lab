@@ -382,9 +382,15 @@ def test_period_settings_flow_to_catalog_chart_and_export(tmp_path: Path) -> Non
         "signal_period": 6,
     }
     views = {view["id"]: view for view in bars_payload["indicators"]}
-    assert views["atr_10"]["label"] == "ATR"
-    assert views["ema_9"]["label"] == "EMA"
-    assert views["rsi_7"]["label"] == "RSI"
+    assert views["atr_10"]["label"] == "ATR 10"
+    assert views["ema_9"]["label"] == "EMA 9"
+    assert views["rsi_7"]["label"] == "RSI 7"
+    assert [setting["key"] for setting in views["macd_5_34_6"]["settings"]] == [
+        "macd_fast_period",
+        "macd_slow_period",
+        "macd_signal_period",
+    ]
+    assert views["candle_range_to_close"]["settings"] == []
     assert export.status_code == 200
     with ZipFile(BytesIO(export.content)) as archive:
         table = next(name for name in archive.namelist() if name.endswith(".csv"))
@@ -620,7 +626,7 @@ def test_stored_chart_uses_matching_period_specific_indicator_views(tmp_path: Pa
     indicators = {indicator["id"]: indicator for indicator in payload["indicators"]}
     assert "atr_10" in indicators
     assert "atr_10_pane" in indicators
-    assert indicators["atr_10"]["label"] == "ATR"
+    assert indicators["atr_10"]["label"] == "ATR 10"
     assert indicators["atr_10"]["values"] == payload["stored_values"]["atr_10"]
     for name in (
         "candle_range_to_atr_10",
