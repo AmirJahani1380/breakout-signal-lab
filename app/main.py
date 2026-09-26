@@ -26,7 +26,7 @@ from .bars import (
     discover_source_catalog,
     load_bars,
 )
-from .event_detectors import DETECTORS, EventConfig, detect_events
+from .event_detectors import EventConfig, detect_events, discover_detectors
 from .feature_export import FeatureExportError, build_feature_frame, export_bar_features
 from .features import (
     FeatureDefinition,
@@ -73,6 +73,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.features = discover()
+        app.state.event_detectors = discover_detectors()
         app.state.imported_datasets = {}
         try:
             app.state.catalog = discover_source_catalog(configured_settings.data_root)
@@ -128,7 +129,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 spec.as_dict() for definition in definitions for spec in definition.specs
             ],
             "event_detectors": [
-                {"id": identifier, "label": label} for identifier, label in DETECTORS.items()
+                {"id": identifier, "label": detector.label}
+                for identifier, detector in app.state.event_detectors.items()
             ],
         }
 
@@ -152,8 +154,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     def selected_detectors(request: Request) -> list[str]:
         raw = request.query_params.get("detectors")
-        names = list(DETECTORS) if raw is None else [name for name in raw.split(",") if name]
-        if len(names) != len(set(names)) or set(names) - DETECTORS.keys():
+        registry = app.state.event_detectors
+        names = list(registry) if raw is None else [name for name in raw.split(",") if name]
+        if len(names) != len(set(names)) or set(names) - registry.keys():
             raise HTTPException(
                 status_code=422, detail="detectors must contain unique known identifiers"
             )
@@ -175,7 +178,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             store = load_bars(selection.source_path, configured_settings.source_timezone)
             config = event_configuration(request)
             detected, swings = detect_events(
-                store.bars, config, selected_detectors(request), f"{symbol}/{timeframe}"
+                store.bars,
+                config,
+                selected_detectors(request),
+                f"{symbol}/{timeframe}",
+                app.state.event_detectors,
             )
             page = store.page(before, limit)
             times = {bar.time for bar in page.display_bars}
@@ -228,6 +235,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 event_configuration(request),
                 selected_detectors(request),
                 f"{symbol}/{timeframe}",
+                app.state.event_detectors,
             )
             event_frame = pd.DataFrame.from_records(detected)
             if event_frame.empty:
@@ -439,9 +447,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         warm_up = max(
             (definition.calculation_warm_up for definition in active_definitions), default=0
         )
+        look_ahead = max(
+            (definition.calculation_look_ahead for definition in active_definitions), default=0
+        )
         try:
             page = load_bars(selection.source_path, configured_settings.source_timezone).page(
-                before, limit, warm_up
+                before, limit, warm_up, look_ahead
             )
         except (OSError, SourceValidationError) as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
@@ -455,6 +466,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 for view in selected_views
                 for feature_name in (view.feature_name, view.color_feature)
                 if feature_name is not None
+            )
+            required_features |= frozenset(
+                feature_name for view in selected_views for feature_name in view.marker_features
             )
             table = (
                 calculate_requested(definition, page.bars, required_features)

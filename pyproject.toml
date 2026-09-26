@@ -20,6 +20,7 @@ dev = [
   "pytest>=8,<9",
   "httpx>=0.27,<1",
   "mypy>=1.11,<2",
+  "numpy<2.5", # NumPy 2.5 stubs require Python 3.12 syntax; mypy targets Python 3.11.
   "pandas-stubs>=2.2,<3",
   "ruff>=0.6,<1",
   "playwright>=1.47,<2",

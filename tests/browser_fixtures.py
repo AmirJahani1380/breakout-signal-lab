@@ -15,7 +15,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, sync_playwright
 
-from tests.test_bars import write_workbook
+from tests.test_bars import write_csv, write_workbook
 
 
 def free_port() -> int:
@@ -82,6 +82,14 @@ def viewer_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
             (1_735_689_600, 2, 3, 0, 1, 5),
             (1_735_690_500, 1.5, 4, 1, 3.5, 5),
             (1_735_691_400, 3, 4, 2, 3.2, 5),
+        ],
+    )
+    pivot_closes = [6, 8, 10, 12, 10, 8, 6, 4, 6, 8, 6]
+    write_csv(
+        root / "PIVOT_H1.csv",
+        [
+            (1_735_689_600 + index * 60, close, close + 1, close - 1, close, 1)
+            for index, close in enumerate(pivot_closes)
         ],
     )
     port = free_port()

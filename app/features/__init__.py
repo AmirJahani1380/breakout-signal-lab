@@ -159,6 +159,8 @@ class FeatureViewSpec:
     scale_range: tuple[float, float] | None = None
     reference_lines: tuple[Mapping[str, object], ...] = ()
     color_feature: str | None = None
+    marker_features: tuple[str, ...] = ()
+    marker_offset_bars: int = 0
     color_palette: tuple[str, str] = ("#00d08499", "#ff4d6d99")
     selection_key: str | None = None
     candle_color: str | None = None
@@ -218,6 +220,16 @@ class FeatureViewSpec:
             raise ValueError(
                 "color_feature must contain lowercase letters, numbers, or underscores"
             )
+        if any(not NAME_PATTERN.fullmatch(name) for name in self.marker_features):
+            raise ValueError("marker_features must contain valid feature names")
+        if len(self.marker_features) != len(set(self.marker_features)) or (
+            self.feature_name in self.marker_features
+        ):
+            raise ValueError("marker_features must be unique and exclude feature_name")
+        if self.marker_features and self.renderer != "marker":
+            raise ValueError("marker_features require the marker renderer")
+        if type(self.marker_offset_bars) is not int:
+            raise ValueError("marker_offset_bars must be an integer")
         if len(self.color_palette) != 2 or any(
             not isinstance(color, str) or not COLOR_PATTERN.fullmatch(color)
             for color in self.color_palette
@@ -244,29 +256,46 @@ class FeatureViewSpec:
     def definition(
         self, table: FeatureTable, timestamps: set[int] | None = None
     ) -> dict[str, object]:
-        if self.feature_name not in table.frame:
-            raise ValueError(f"feature table has no {self.feature_name!r} column")
+        feature_names = (self.feature_name, *self.marker_features)
+        missing = set(feature_names) - set(table.frame.columns)
+        if missing:
+            raise ValueError(f"feature table has no columns {sorted(missing)!r}")
         if self.color_feature is not None and self.color_feature not in table.frame:
             raise ValueError(f"feature table has no {self.color_feature!r} color column")
         values = []
         points = []
-        feature_spec = next(spec for spec in table.specs if spec.name == self.feature_name)
-        for timestamp, value in table.frame[self.feature_name].items():
-            if timestamps is not None and timestamp not in timestamps:
-                continue
-            if pd.isna(value):
-                continue
-            normalized = bool(value) if feature_spec.dtype == "boolean" else float(value)
-            detail = {"time": int(cast(int, timestamp)), "value": normalized}
-            if self.show_in_crosshair or self.candle_color is not None:
-                values.append(detail)
-            if self.renderer is not None:
-                point: dict[str, object] = dict(detail)
+        specs = {spec.name: spec for spec in table.specs}
+        row_positions = {int(timestamp): index for index, timestamp in enumerate(table.frame.index)}
+        for feature_name in feature_names:
+            feature_spec = specs[feature_name]
+            for timestamp, value in table.frame[feature_name].items():
+                if pd.isna(value):
+                    continue
+                original_time = int(cast(int, timestamp))
+                normalized = bool(value) if feature_spec.dtype == "boolean" else float(value)
+                if feature_name == self.feature_name and (
+                    timestamps is None or original_time in timestamps
+                ):
+                    detail = {"time": original_time, "value": normalized}
+                    if self.show_in_crosshair or self.candle_color is not None:
+                        values.append(detail)
+                if self.renderer is None:
+                    continue
+                point_time = original_time
+                if self.renderer == "marker" and self.marker_offset_bars:
+                    point_position = row_positions[original_time] + self.marker_offset_bars
+                    if not 0 <= point_position < len(table.frame.index):
+                        continue
+                    point_time = int(table.frame.index[point_position])
+                if timestamps is not None and point_time not in timestamps:
+                    continue
+                point: dict[str, object] = {"time": point_time, "value": normalized}
                 if self.color_feature is not None:
                     color_value = table.frame.at[timestamp, self.color_feature]
                     if not pd.isna(color_value):
                         point["color"] = self.color_palette[0 if bool(color_value) else 1]
                 points.append(point)
+        points.sort(key=lambda point: cast(int, point["time"]))
         series_types = {"line": "LineSeries", "histogram": "HistogramSeries"}
         series_type = series_types[self.renderer] if self.renderer in series_types else None
         return {
@@ -274,7 +303,7 @@ class FeatureViewSpec:
             "selection_key": self.selection_key or self.identifier,
             "candle_color": self.candle_color,
             "feature_name": self.feature_name,
-            "source": feature_spec.source,
+            "source": specs[self.feature_name].source,
             "label": self.label,
             "description": self.description,
             "visualization": self.visualization,
@@ -303,6 +332,7 @@ class FeatureDefinition:
     calculate_selected: Callable[[Sequence[Bar], frozenset[str]], FeatureTable] | None = None
     settings: tuple[FeatureSetting, ...] = ()
     configure: Callable[[Mapping[str, int]], FeatureDefinition] | None = None
+    calculation_look_ahead: int = 0
 
     def __post_init__(self) -> None:
         if (
@@ -311,6 +341,8 @@ class FeatureDefinition:
             or self.calculation_warm_up < 0
         ):
             raise ValueError("calculation_warm_up must be a non-negative integer")
+        if type(self.calculation_look_ahead) is not int or self.calculation_look_ahead < 0:
+            raise ValueError("calculation_look_ahead must be a non-negative integer")
         if self.calculate_selected is not None and not callable(self.calculate_selected):
             raise ValueError("calculate_selected must be callable")
         if self.settings and self.configure is None:
@@ -452,6 +484,8 @@ def _validate_definition(value: object) -> FeatureDefinition:
     for view in value.views:
         if view.feature_name not in names:
             raise ValueError(f"view {view.identifier!r} references an unknown feature")
+        if not set(view.marker_features) <= names:
+            raise ValueError(f"view {view.identifier!r} references an unknown marker feature")
         if view.color_feature is not None and view.color_feature not in names:
             raise ValueError(f"view {view.identifier!r} references an unknown color feature")
     return value

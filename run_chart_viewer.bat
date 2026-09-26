@@ -15,3 +15,4 @@ if not exist "%PYTHON%" (
 start "Breakout Chart Server" /min powershell.exe -NoExit -Command "& '%PYTHON%' -m uvicorn app.main:app --host 127.0.0.1 --port 8000"
 timeout /t 2 /nobreak >nul
 start "" "http://127.0.0.1:8000"
+

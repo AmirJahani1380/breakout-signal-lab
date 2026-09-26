@@ -159,8 +159,6 @@ const candles = chart.addSeries(LightweightCharts.CandlestickSeries, {
 /** @typedef {{id:string,detector:string,configuration:Record<string, number>,direction:string,setup_id:string,signal_time:number,availability_time:number,broken_level:number,breakout_price:number,reason:string}} BreakoutEvent */
 /** @type {BreakoutEvent[]} */
 let breakoutEvents = [];
-/** @type {Array<{direction:string,pivot_time:number,availability_time:number,level:number}>} */
-let confirmedSwings = [];
 /** @type {string | null} */
 let selectedEventId = null;
 /** @type {any} */
@@ -184,34 +182,20 @@ function addEventSettings(url) {
 
 function renderEventMarkers() {
   const visibleTimes = new Set(bars.map((bar) => bar.time));
-  const markers = [
-    ...confirmedSwings
-      .filter((swing) => visibleTimes.has(swing.pivot_time))
-      .map((swing) => ({
-        time: swing.pivot_time,
-        position: "atPriceMiddle",
-        price: swing.level,
-        shape: "circle",
-        color: "#ef5350",
-        size: 1,
-        text: `Confirmed ${swing.direction}`,
-      })),
-    ...breakoutEvents
-      .filter(
-        (event) =>
-          visibleTimes.has(event.signal_time) &&
-          selectedDetectorIds().includes(event.detector),
-      )
-      .map((event) => ({
-        time: event.signal_time,
-        position:
-          event.direction === "bullish" ? "atPriceBottom" : "atPriceTop",
-        price: event.breakout_price,
-        shape: event.direction === "bullish" ? "arrowUp" : "arrowDown",
-        color: event.direction === "bullish" ? "#26a69a" : "#ef5350",
-        text: String(event.breakout_price),
-      })),
-  ].sort((left, right) => left.time - right.time);
+  const markers = breakoutEvents
+    .filter(
+      (event) =>
+        visibleTimes.has(event.signal_time) &&
+        selectedDetectorIds().includes(event.detector),
+    )
+    .map((event) => ({
+      time: event.signal_time,
+      position: event.direction === "bullish" ? "atPriceBottom" : "atPriceTop",
+      price: event.breakout_price,
+      shape: event.direction === "bullish" ? "arrowUp" : "arrowDown",
+      color: event.direction === "bullish" ? "#00c853" : "#ef5350",
+    }))
+    .sort((left, right) => left.time - right.time);
   breakoutMarkers.setMarkers(markers);
   chartContainer.dataset.eventMarkerCount = String(markers.length);
 }
@@ -400,11 +384,15 @@ function updateIndicatorSeries() {
   }
   chartContainer.dataset.indicatorPointCounts = JSON.stringify(pointCounts);
   chartContainer.dataset.markerCount = String(
-    [...indicatorMarkers.keys()].reduce(
-      (total, identifier) =>
-        total + (indicatorPoints.get(identifier)?.length ?? 0),
-      0,
-    ),
+    [...indicatorMarkers.keys()].reduce((total, identifier) => {
+      const state = indicatorStates.get(identifier);
+      return (
+        total +
+        (state?.applied && state.visible
+          ? (indicatorPoints.get(identifier)?.length ?? 0)
+          : 0)
+      );
+    }, 0),
   );
 }
 
@@ -461,9 +449,7 @@ function toggleIndicatorVisibility(identifier) {
   if (!state?.applied || !definition) return;
   state.visible = !state.visible;
   indicatorSeries.get(identifier)?.applyOptions({ visible: state.visible });
-  indicatorMarkers
-    .get(identifier)
-    ?.setMarkers(state.visible ? markerPoints(definition) : []);
+  updateIndicatorSeries();
   renderIndicatorState(identifier);
 }
 
@@ -742,10 +728,6 @@ async function load(before, version) {
         before === null
           ? eventPayload.events
           : [...eventPayload.events, ...breakoutEvents];
-      confirmedSwings =
-        before === null
-          ? eventPayload.swings
-          : [...eventPayload.swings, ...confirmedSwings];
       renderEventList();
     }
     const range = chart.timeScale().getVisibleLogicalRange();
@@ -840,7 +822,6 @@ function selectTimeframe(symbol, timeframe) {
   activeSelection = { symbol, timeframe };
   bars = [];
   breakoutEvents = [];
-  confirmedSwings = [];
   selectedEventId = null;
   for (const definition of indicatorDefinitions)
     indicatorPoints.set(definition.id, []);
@@ -995,7 +976,6 @@ dataMode.addEventListener("change", () => {
   loading = false;
   bars = [];
   breakoutEvents = [];
-  confirmedSwings = [];
   selectedEventId = null;
   storedValues = {};
   storedFeatures = [];

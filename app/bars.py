@@ -63,13 +63,18 @@ class BarStore:
             columns=("time", "open", "high", "low", "close", "volume"),
         ).set_index("time")
 
-    def page(self, before: int | None, display_limit: int, warm_up: int = 0) -> BarPage:
+    def page(
+        self, before: int | None, display_limit: int, warm_up: int = 0, look_ahead: int = 0
+    ) -> BarPage:
+        if type(look_ahead) is not int or look_ahead < 0:
+            raise ValueError("look_ahead must be a non-negative integer")
         end = len(self.bars) if before is None else bisect_left(self.times, before)
         display_start = max(0, end - display_limit)
         calculation_start = max(0, display_start - warm_up)
         return BarPage(
-            self.bars[calculation_start:end],
+            self.bars[calculation_start : end + look_ahead],
             display_start - calculation_start,
+            end - calculation_start,
             display_start > 0,
         )
 
@@ -78,11 +83,12 @@ class BarStore:
 class BarPage:
     bars: tuple[Bar, ...]
     display_start: int
+    display_end: int
     has_more: bool
 
     @property
     def display_bars(self) -> tuple[Bar, ...]:
-        return self.bars[self.display_start :]
+        return self.bars[self.display_start : self.display_end]
 
 
 @dataclass(frozen=True, slots=True)

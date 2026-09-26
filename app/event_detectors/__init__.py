@@ -1,71 +1,25 @@
-"""Causal close-crossing events with stable signal/setup identities."""
+"""Discoverable close-crossing event detectors."""
 
 from __future__ import annotations
 
-from bisect import bisect_left, bisect_right
-from collections.abc import Sequence
+import importlib
+import json
+import logging
+import pkgutil
+import re
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
-from json import dumps
 from math import isfinite
-from typing import cast
+from typing import Literal, cast
 
 from app.bars import Bar
 from app.features.confirmed_swing import ConfirmedSwing, confirmed_swings
-from app.features.ema import ema_step
 
-DETECTORS = {"ema_breakout": "EMA close crossing", "swing_breakout": "Confirmed swing breakout"}
-
-
-class _OutstandingSwings:
-    """Price-indexed active pivots; range queries visit only setups that fire."""
-
-    def __init__(self, swings: Sequence[ConfirmedSwing], direction: str) -> None:
-        self.levels = sorted({swing.level for swing in swings if swing.direction == direction})
-        self.buckets: list[list[ConfirmedSwing]] = [[] for _ in self.levels]
-        self.counts = [0] * (len(self.levels) + 1)
-
-    def _change_count(self, index: int, change: int) -> None:
-        position = index + 1
-        while position < len(self.counts):
-            self.counts[position] += change
-            position += position & -position
-
-    def _count_before(self, end: int) -> int:
-        count = 0
-        while end:
-            count += self.counts[end]
-            end -= end & -end
-        return count
-
-    def _index_at_rank(self, rank: int) -> int:
-        position = 0
-        bit = 1 << (len(self.levels).bit_length() - 1)
-        while bit:
-            candidate = position + bit
-            if candidate < len(self.counts) and self.counts[candidate] < rank:
-                rank -= self.counts[candidate]
-                position = candidate
-            bit >>= 1
-        return position
-
-    def add(self, swing: ConfirmedSwing) -> None:
-        index = bisect_left(self.levels, swing.level)
-        self.buckets[index].append(swing)
-        self._change_count(index, 1)
-
-    def take_crossed(self, lower: float, upper: float) -> list[ConfirmedSwing]:
-        start = bisect_right(self.levels, lower)
-        end = bisect_left(self.levels, upper)
-        crossed: list[ConfirmedSwing] = []
-        first_rank = self._count_before(start) + 1
-        while first_rank <= self._count_before(end):
-            index = self._index_at_rank(first_rank)
-            bucket = self.buckets[index]
-            crossed.extend(bucket)
-            self._change_count(index, -len(bucket))
-            self.buckets[index] = []
-        return crossed
+logger = logging.getLogger(__name__)
+DETECTOR_ID_PATTERN = re.compile(r"^[a-z][a-z0-9_]*$")
+Event = dict[str, object]
+Direction = Literal["bullish", "bearish"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,38 +44,70 @@ class EventConfig:
             raise ValueError("buffer must be a finite non-negative number")
 
 
-def _event(
+DetectFunction = Callable[[Sequence[Bar], EventConfig, str], Sequence[Event]]
+
+
+@dataclass(frozen=True, slots=True)
+class EventDetector:
+    """A detector module's stable identifier, UI label, and event calculation."""
+
+    identifier: str
+    label: str
+    detect: DetectFunction
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.identifier, str) or not DETECTOR_ID_PATTERN.fullmatch(
+            self.identifier
+        ):
+            raise ValueError(
+                "detector identifier must contain lowercase letters, numbers, or underscores"
+            )
+        if not isinstance(self.label, str) or not self.label.strip():
+            raise ValueError("detector label must not be empty")
+        if not callable(self.detect):
+            raise ValueError("detector detect must be callable")
+
+
+def make_event(
     detector: str,
-    direction: str,
+    direction: Direction,
     signal: Bar,
-    level: float,
-    setup: str,
-    availability: int,
-    config: EventConfig,
-    dataset_id: str,
-) -> dict[str, object]:
-    configuration = (
-        {"ema_period": config.ema_period, "buffer": config.buffer}
-        if detector == "ema_breakout"
-        else {
-            "swing_left": config.swing_left,
-            "swing_right": config.swing_right,
-            "buffer": config.buffer,
-        }
-    )
-    identity = [dataset_id, detector, configuration, direction, setup, signal.time]
+    broken_level: float,
+    setup_id: str,
+    availability_time: int,
+    configuration: Mapping[str, object],
+    dataset_id: str = "",
+) -> Event:
+    """Build the shared event response shape and deterministic event ID."""
+    if direction not in ("bullish", "bearish"):
+        raise ValueError("event direction must be bullish or bearish")
+    try:
+        normalized_configuration = dict(configuration)
+        encoded_configuration = json.dumps(
+            normalized_configuration, sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"event configuration must be finite JSON data: {error}") from error
+    identity = [
+        dataset_id,
+        detector,
+        json.loads(encoded_configuration),
+        direction,
+        setup_id,
+        signal.time,
+    ]
     identifier = sha256(
-        dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()[:24]
     return {
         "id": identifier,
         "detector": detector,
-        "configuration": configuration,
+        "configuration": normalized_configuration,
         "direction": direction,
-        "setup_id": setup,
+        "setup_id": setup_id,
         "signal_time": signal.time,
-        "availability_time": availability,
-        "broken_level": level,
+        "availability_time": availability_time,
+        "broken_level": broken_level,
         "breakout_price": signal.close,
         "reason": (
             f"close crossed {'above' if direction == 'bullish' else 'below'} {detector} level"
@@ -129,87 +115,98 @@ def _event(
     }
 
 
+def discover_detectors() -> dict[str, EventDetector]:
+    """Load valid modules that export an EventDetector named ``detector``."""
+    discovered: dict[str, EventDetector] = {}
+    for module_info in pkgutil.iter_modules(__path__, f"{__name__}."):
+        try:
+            module = importlib.import_module(module_info.name)
+            detector = getattr(module, "detector", None)
+            if not isinstance(detector, EventDetector):
+                raise ValueError("module must export an EventDetector named 'detector'")
+            if detector.identifier in discovered:
+                raise ValueError(f"duplicate detector identifier {detector.identifier!r}")
+        except Exception as error:
+            logger.warning("Skipping event detector module %s: %s", module_info.name, error)
+            continue
+        discovered[detector.identifier] = detector
+    return discovered
+
+
+def _validated_event(
+    detector_id: str, index: int, candidate: object, closes: Mapping[int, float]
+) -> Event:
+    prefix = f"detector {detector_id!r} event {index}"
+    required = {
+        "id",
+        "detector",
+        "configuration",
+        "direction",
+        "setup_id",
+        "signal_time",
+        "availability_time",
+        "broken_level",
+        "breakout_price",
+        "reason",
+    }
+    if not isinstance(candidate, dict):
+        raise ValueError(f"{prefix} must be a record from make_event")
+    missing = required - candidate.keys()
+    if missing:
+        raise ValueError(f"{prefix} is missing fields: {sorted(missing)!r}")
+    if candidate["detector"] != detector_id:
+        raise ValueError(f"{prefix} has a different detector identifier")
+    for field in ("id", "setup_id", "reason"):
+        if not isinstance(candidate[field], str) or not candidate[field].strip():
+            raise ValueError(f"{prefix} {field} must be a non-empty string")
+    if candidate["direction"] not in ("bullish", "bearish"):
+        raise ValueError(f"{prefix} direction must be bullish or bearish")
+    signal_time = candidate["signal_time"]
+    availability_time = candidate["availability_time"]
+    if type(signal_time) is not int or signal_time not in closes:
+        raise ValueError(f"{prefix} signal_time must identify a source bar")
+    if type(availability_time) is not int or availability_time > signal_time:
+        raise ValueError(f"{prefix} availability_time must be no later than signal_time")
+    for field in ("broken_level", "breakout_price"):
+        number = candidate[field]
+        if isinstance(number, bool) or not isinstance(number, (int, float)) or not isfinite(number):
+            raise ValueError(f"{prefix} {field} must be a finite number")
+    if candidate["breakout_price"] != closes[signal_time]:
+        raise ValueError(f"{prefix} breakout_price must match the signal close")
+    if not isinstance(candidate["configuration"], dict):
+        raise ValueError(f"{prefix} configuration must be a JSON object")
+    try:
+        json.dumps(candidate, allow_nan=False)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{prefix} must contain finite JSON values: {error}") from error
+    return candidate
+
+
 def detect_events(
     bars: Sequence[Bar],
     config: EventConfig = EventConfig(),
-    detectors: Sequence[str] = ("ema_breakout", "swing_breakout"),
+    detectors: Sequence[str] | None = None,
     dataset_id: str = "",
-) -> tuple[tuple[dict[str, object], ...], tuple[ConfirmedSwing, ...]]:
-    unknown = set(detectors) - DETECTORS.keys()
-    if unknown or len(detectors) != len(set(detectors)):
+    registry: Mapping[str, EventDetector] | None = None,
+) -> tuple[tuple[Event, ...], tuple[ConfirmedSwing, ...]]:
+    """Run selected detector modules and return their events plus confirmed pivots."""
+    registered = DETECTORS if registry is None else registry
+    selected = tuple(registered) if detectors is None else tuple(detectors)
+    unknown = set(selected) - registered.keys()
+    if unknown or len(selected) != len(set(selected)):
         raise ValueError(f"event detectors must be unique and known: {sorted(unknown)!r}")
+
+    closes = {bar.time: bar.close for bar in bars}
+    events: list[Event] = []
+    for identifier in selected:
+        detected = registered[identifier].detect(bars, config, dataset_id)
+        if not isinstance(detected, Sequence) or isinstance(detected, (str, bytes)):
+            raise ValueError(f"detector {identifier!r} must return a sequence of event records")
+        events.extend(
+            _validated_event(identifier, index, event, closes)
+            for index, event in enumerate(detected)
+        )
     swings = confirmed_swings(bars, config.swing_left, config.swing_right)
-    events: list[dict[str, object]] = []
-    if "ema_breakout" in detectors:
-        previous_ema: float | None = None
-        for index, bar in enumerate(bars):
-            current_ema = ema_step(previous_ema, bar.close, config.ema_period)
-            if index:
-                previous_close = bars[index - 1].close
-                assert previous_ema is not None
-                for direction, crossed in (
-                    (
-                        "bullish",
-                        previous_close < previous_ema - config.buffer
-                        and bar.close > current_ema + config.buffer,
-                    ),
-                    (
-                        "bearish",
-                        previous_close > previous_ema + config.buffer
-                        and bar.close < current_ema - config.buffer,
-                    ),
-                ):
-                    if crossed:
-                        events.append(
-                            _event(
-                                "ema_breakout",
-                                direction,
-                                bar,
-                                current_ema,
-                                f"ema_{config.ema_period}",
-                                bar.time,
-                                config,
-                                dataset_id,
-                            )
-                        )
-            previous_ema = current_ema
-    if "swing_breakout" in detectors:
-        # The index contains future prices, but a pivot enters its active
-        # bucket only after confirmation; future bars cannot affect signals.
-        active = {
-            "high": _OutstandingSwings(swings, "high"),
-            "low": _OutstandingSwings(swings, "low"),
-        }
-        next_swing = 0
-        for index, bar in enumerate(bars):
-            while next_swing < len(swings) and swings[next_swing].availability_time < bar.time:
-                swing = swings[next_swing]
-                active[swing.direction].add(swing)
-                next_swing += 1
-            if not index:
-                continue
-            previous_close = bars[index - 1].close
-            if bar.close == previous_close:
-                continue
-            swing_type = "high" if bar.close > previous_close else "low"
-            direction = "bullish" if swing_type == "high" else "bearish"
-            lower = (previous_close if swing_type == "high" else bar.close) + config.buffer
-            upper = (bar.close if swing_type == "high" else previous_close) - config.buffer
-            if lower >= upper:
-                continue
-            for swing in active[swing_type].take_crossed(lower, upper):
-                events.append(
-                    _event(
-                        "swing_breakout",
-                        direction,
-                        bar,
-                        swing.level,
-                        f"{swing.direction}:{swing.pivot_time}",
-                        swing.availability_time,
-                        config,
-                        dataset_id,
-                    )
-                )
     events.sort(
         key=lambda event: (
             cast(int, event["signal_time"]),
@@ -218,3 +215,6 @@ def detect_events(
         )
     )
     return tuple(events), swings
+
+
+DETECTORS = discover_detectors()

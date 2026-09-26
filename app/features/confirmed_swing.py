@@ -61,19 +61,22 @@ feature = FeatureDefinition(
     calculate,
     (
         FeatureViewSpec(
+            "confirmed_swing_3_3",
             _HIGH.name,
-            _HIGH.name,
-            "Confirmed swing high 3/3",
-            "Level available on confirmation candle",
-            None,
-        ),
-        FeatureViewSpec(
-            _LOW.name,
-            _LOW.name,
-            "Confirmed swing low 3/3",
-            "Level available on confirmation candle",
-            None,
+            "Confirmed swings 3/3",
+            "Red dots show confirmed swing highs and lows on their pivot candles",
+            "marker",
+            show_in_crosshair=False,
+            series_options={
+                "position": "atPriceMiddle",
+                "shape": "circle",
+                "color": "#ef5350",
+                "size": 1,
+            },
+            marker_features=(_LOW.name,),
+            marker_offset_bars=-3,
         ),
     ),
     calculation_warm_up=6,
+    calculation_look_ahead=3,
 )

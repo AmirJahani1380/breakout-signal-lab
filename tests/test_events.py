@@ -3,14 +3,16 @@ from __future__ import annotations
 import io
 import random
 import zipfile
+from collections.abc import Sequence
 from pathlib import Path
 
 import pandas as pd
 import pytest
 from fastapi.testclient import TestClient
 
+import app.event_detectors as event_detectors
 from app.bars import Bar
-from app.event_detectors import EventConfig, detect_events
+from app.event_detectors import EventConfig, EventDetector, detect_events, make_event
 from app.features.confirmed_swing import confirmed_swings
 from app.main import Settings, create_app
 
@@ -93,7 +95,7 @@ def test_swing_confirmation_ties_and_strict_next_bar_eligibility() -> None:
     assert buffered == ()
 
 
-def test_swing_ignores_gap_and_wick_and_each_setup_fires_once() -> None:
+def test_swing_ignores_gap_and_wick_and_rearms_after_return_inside_channel() -> None:
     first_five = bars_from_closes([8, 9, 12, 9, 8])
     for opening in (8, 14):
         crossing_attempt = Bar(6, opening, 15, 7, 12, 1)
@@ -109,7 +111,10 @@ def test_swing_ignores_gap_and_wick_and_each_setup_fires_once() -> None:
         EventConfig(swing_left=2, swing_right=2),
         ["swing_breakout"],
     )
-    assert [(event["setup_id"], event["signal_time"]) for event in repeated] == [("high:3", 6)]
+    assert [(event["setup_id"], event["signal_time"]) for event in repeated] == [
+        ("high:3", 6),
+        ("high:3", 8),
+    ]
 
 
 def test_indexed_swing_crossings_match_close_rule_on_varied_prices() -> None:
@@ -118,25 +123,152 @@ def test_indexed_swing_crossings_match_close_rule_on_varied_prices() -> None:
     config = EventConfig(swing_left=2, swing_right=2, buffer=0.5)
     actual, swings = detect_events(bars, config, ["swing_breakout"])
     expected: list[tuple[str, int]] = []
-    fired: set[str] = set()
+    upper = None
+    lower = None
+    next_swing = 0
     for previous, current in zip(bars, bars[1:]):
-        for swing in swings:
-            setup = f"{swing.direction}:{swing.pivot_time}"
-            if setup in fired or swing.availability_time >= current.time:
-                continue
-            crossed = (
-                previous.close < swing.level - config.buffer
-                and current.close > swing.level + config.buffer
-                if swing.direction == "high"
-                else previous.close > swing.level + config.buffer
-                and current.close < swing.level - config.buffer
-            )
-            if crossed:
-                expected.append((setup, current.time))
-                fired.add(setup)
+        while next_swing < len(swings) and swings[next_swing].availability_time <= previous.time:
+            swing = swings[next_swing]
+            if swing.direction == "high" and (upper is None or swing.level > upper.level):
+                upper = swing
+            elif swing.direction == "low" and (lower is None or swing.level < lower.level):
+                lower = swing
+            next_swing += 1
+        if upper is not None and (
+            previous.close < upper.level - config.buffer
+            and current.close > upper.level + config.buffer
+        ):
+            expected.append((f"high:{upper.pivot_time}", current.time))
+        if lower is not None and (
+            previous.close > lower.level + config.buffer
+            and current.close < lower.level - config.buffer
+        ):
+            expected.append((f"low:{lower.pivot_time}", current.time))
     assert sorted(
         (str(event["setup_id"]), int(event["signal_time"])) for event in actual
     ) == sorted(expected)
+
+
+def test_swing_channel_uses_only_the_previous_confirmed_edges() -> None:
+    bars = bars_from_closes([8, 9, 12, 9, 8, 14, 15, 16])
+    events, swings = detect_events(
+        bars, EventConfig(swing_left=2, swing_right=2), ["swing_breakout"]
+    )
+    high = next(swing for swing in swings if swing.direction == "high")
+    assert high.availability_time == bars[4].time
+    assert [(event["direction"], event["signal_time"]) for event in events] == [
+        ("bullish", bars[5].time)
+    ]
+
+
+def test_drop_in_detector_is_discovered_and_exposed_without_other_code_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_path = tmp_path / "custom_rising.py"
+    module_path.write_text(
+        """from app.bars import Bar
+from app.event_detectors import Event, EventConfig, EventDetector, make_event
+from collections.abc import Sequence
+
+def detect(bars: Sequence[Bar], config: EventConfig, dataset_id: str) -> tuple[Event, ...]:
+    if len(bars) < 2 or bars[-1].close <= bars[-2].close:
+        return ()
+    return (make_event("custom_rising", "bullish", bars[-1], bars[-2].close,
+                       "last_close", bars[-1].time, {}, dataset_id),)
+
+detector = EventDetector("custom_rising", "Custom rising close", detect)
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(event_detectors, "__path__", [*event_detectors.__path__, str(tmp_path)])
+    root = tmp_path / "market"
+    root.mkdir()
+    (root / "RISING_H1.csv").write_text(
+        "time,open,high,low,close,volume\n1,10,11,9,10,1\n2,11,12,10,11,1\n",
+        encoding="utf-8",
+    )
+
+    with TestClient(create_app(Settings(root))) as client:
+        catalog = client.get("/api/v1/features").json()["event_detectors"]
+        response = client.get(
+            "/api/v1/events",
+            params={"symbol": "RISING", "timeframe": "H1", "detectors": "custom_rising"},
+        )
+
+    assert {detector["id"] for detector in catalog} >= {"custom_rising"}
+    assert response.status_code == 200
+    assert response.json()["events"][0]["detector"] == "custom_rising"
+
+
+@pytest.mark.parametrize(
+    ("invalid_field", "invalid_value", "expected_error"),
+    [
+        ("detector", "different", "different detector identifier"),
+        ("setup_id", None, "missing fields"),
+        ("broken_level", float("nan"), "broken_level must be a finite number"),
+    ],
+)
+def test_invalid_drop_in_detector_output_has_actionable_api_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    invalid_field: str,
+    invalid_value: object,
+    expected_error: str,
+) -> None:
+    def invalid_detect(
+        bars: Sequence[Bar], config: EventConfig, dataset_id: str
+    ) -> tuple[dict[str, object], ...]:
+        event = make_event(
+            "broken", "bullish", bars[-1], bars[-2].close, "close", bars[-1].time, {}, dataset_id
+        )
+        if invalid_value is None:
+            del event[invalid_field]
+        else:
+            event[invalid_field] = invalid_value
+        return (event,)
+
+    monkeypatch.setattr(
+        "app.main.discover_detectors",
+        lambda: {"broken": EventDetector("broken", "Broken detector", invalid_detect)},
+    )
+    root = tmp_path / "market"
+    root.mkdir()
+    (root / "EURUSD_H1.csv").write_text(
+        "time,open,high,low,close,volume\n1,10,11,9,10,1\n2,11,12,10,11,1\n",
+        encoding="utf-8",
+    )
+    with TestClient(create_app(Settings(root))) as client:
+        response = client.get(
+            "/api/v1/events",
+            params={"symbol": "EURUSD", "timeframe": "H1", "detectors": "broken"},
+        )
+    assert response.status_code == 422
+    assert "detector 'broken' event 0" in response.json()["detail"]
+    assert expected_error in response.json()["detail"]
+
+
+def test_swing_indicator_combines_both_directions_as_red_dots() -> None:
+    from app.features.confirmed_swing import feature
+
+    closes = [6, 8, 10, 12, 10, 8, 6, 4, 6, 8, 6]
+    bars = bars_from_closes(closes)
+    definition = feature.views[0].definition(feature.calculate(bars), {bar.time for bar in bars})
+
+    assert len(feature.views) == 1
+    assert definition["id"] == "confirmed_swing_3_3"
+    assert [point["time"] for point in definition["points"]] == [4, 8]
+    assert definition["series_options"] == {
+        "position": "atPriceMiddle",
+        "shape": "circle",
+        "color": "#ef5350",
+        "size": 1,
+    }
+    assert all("text" not in point for point in definition["points"])
+    inverted = bars_from_closes([20 - close for close in closes])
+    inverted_view = feature.views[0].definition(
+        feature.calculate(inverted), {bar.time for bar in inverted}
+    )
+    assert [point["time"] for point in inverted_view["points"]] == [4, 8]
 
 
 def test_future_causality_and_configuration_validation() -> None:

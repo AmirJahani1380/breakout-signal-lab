@@ -33,6 +33,33 @@ def test_event_chart_overlay_matches_api_record(page: Page, viewer_url: str) -> 
     assert str(record["setup_id"]) in page.locator("#event-details").inner_text()
 
 
+def test_swing_indicator_controls_pivot_dots_on_the_chart(page: Page, viewer_url: str) -> None:
+    page.goto(viewer_url)
+    page.locator("#symbol").select_option("PIVOT")
+    page.get_by_role("button", name="H1").click()
+    page.wait_for_function("document.querySelector('#chart').dataset.barCount === '11'")
+    assert page.locator("#chart").get_attribute("data-marker-count") == "0"
+
+    page.get_by_role("tab", name="Indicators").click()
+    swing = page.locator('[data-indicator="confirmed_swing_3_3"]')
+    assert swing.count() == 1
+    swing.locator("[data-apply]").check()
+    page.wait_for_function("document.querySelector('#chart').dataset.markerCount === '2'")
+    swing.get_by_role("button", name="Hide").click()
+    page.wait_for_function("document.querySelector('#chart').dataset.markerCount === '0'")
+    swing.get_by_role("button", name="Show").click()
+    page.wait_for_function("document.querySelector('#chart').dataset.markerCount === '2'")
+    swing.locator("[data-apply]").uncheck()
+    page.wait_for_function("document.querySelector('#chart').dataset.markerCount === '0'")
+
+    payload = page.request.get(
+        f"{viewer_url}/api/v1/bars?symbol=PIVOT&timeframe=H1&features=confirmed_swing_3_3"
+    ).json()
+    indicator = next(item for item in payload["indicators"] if item["id"] == "confirmed_swing_3_3")
+    assert [point["time"] for point in indicator["points"]] == [1_735_689_780, 1_735_690_020]
+    assert all("text" not in point for point in indicator["points"])
+
+
 def test_symbol_then_timeframe_loads_only_the_selected_chart(page: Page, viewer_url: str) -> None:
     page.goto(viewer_url)
     page.locator("#symbol").select_option("EURUSD")

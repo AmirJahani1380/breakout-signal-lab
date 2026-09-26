@@ -48,7 +48,7 @@ def test_selected_dataset_pages_without_loading_another_dataset(
     root = market_root(tmp_path, [valid(100 + index) for index in range(6)])
     write_workbook(root / "GBPUSD_H1.xlsx", [valid(1_000)])
     loaded_paths: list[Path] = []
-    page_requests: list[tuple[int | None, int, int]] = []
+    page_requests: list[tuple[int | None, int, int, int]] = []
     original_load = bars_module.load_bars
     original_page = bars_module.BarStore.page
 
@@ -59,10 +59,14 @@ def test_selected_dataset_pages_without_loading_another_dataset(
         return original_load(source_path, source_timezone, dataset_id)
 
     def track_page(
-        store: bars_module.BarStore, before: int | None, limit: int, warm_up: int
+        store: bars_module.BarStore,
+        before: int | None,
+        limit: int,
+        warm_up: int,
+        look_ahead: int,
     ) -> bars_module.BarPage:
-        page_requests.append((before, limit, warm_up))
-        return original_page(store, before, limit, warm_up)
+        page_requests.append((before, limit, warm_up, look_ahead))
+        return original_page(store, before, limit, warm_up, look_ahead)
 
     monkeypatch.setattr("app.main.load_bars", track_load)
     monkeypatch.setattr(bars_module.BarStore, "page", track_page)
@@ -79,7 +83,7 @@ def test_selected_dataset_pages_without_loading_another_dataset(
         root / "EURUSD_H1_max_bars.xlsx",
         root / "EURUSD_H1_max_bars.xlsx",
     ]
-    assert page_requests == [(None, 2, 100), (104, 2, 100)]
+    assert page_requests == [(None, 2, 100, 3), (104, 2, 100, 3)]
 
 
 def test_feature_gating_bounded_window_and_fresh_source_reads(
@@ -95,9 +99,13 @@ def test_feature_gating_bounded_window_and_fresh_source_reads(
     original_page = bars_module.BarStore.page
 
     def track_page(
-        store: bars_module.BarStore, before: int | None, limit: int, warm_up: int
+        store: bars_module.BarStore,
+        before: int | None,
+        limit: int,
+        warm_up: int,
+        look_ahead: int,
     ) -> bars_module.BarPage:
-        page = original_page(store, before, limit, warm_up)
+        page = original_page(store, before, limit, warm_up, look_ahead)
         requests.append((len(page.bars), warm_up))
         return page
 
@@ -252,8 +260,7 @@ def test_bars_include_backend_calculated_indicators(tmp_path: Path) -> None:
             "candle_range",
             "candle_range_to_atr_20",
             "candle_range_to_close",
-            "confirmed_swing_high_3_3",
-            "confirmed_swing_low_3_3",
+            "confirmed_swing_3_3",
             "ema_20",
             "is_engulfing",
             "lower_wick_size",
@@ -279,6 +286,37 @@ def test_bars_include_backend_calculated_indicators(tmp_path: Path) -> None:
         ]
         assert definitions["volume"]["default_applied"] is True
         assert all(isinstance(point["value"], float) for point in definitions["ema_20"]["points"])
+
+
+def test_confirmed_swing_pivot_survives_page_boundary(tmp_path: Path) -> None:
+    closes = [6, 7, 8, 9, 15, 8, 7, 6, 5, 4]
+    root = tmp_path / "market"
+    root.mkdir()
+    write_csv(
+        root / "PIVOT_H1.csv",
+        [
+            (100 + index, close, close + 1, close - 1, close, 1)
+            for index, close in enumerate(closes)
+        ],
+    )
+    with TestClient(create_app(Settings(root))) as client:
+        latest = client.get(
+            "/api/v1/bars?symbol=PIVOT&timeframe=H1&limit=5&features=confirmed_swing_3_3"
+        ).json()
+        older = client.get(
+            "/api/v1/bars",
+            params={
+                "symbol": "PIVOT",
+                "timeframe": "H1",
+                "limit": 5,
+                "before": latest["next_before"],
+                "features": "confirmed_swing_3_3",
+            },
+        ).json()
+    assert [bar["time"] for bar in latest["bars"]] == [105, 106, 107, 108, 109]
+    assert [bar["time"] for bar in older["bars"]] == [100, 101, 102, 103, 104]
+    swing = next(view for view in older["indicators"] if view["id"] == "confirmed_swing_3_3")
+    assert swing["points"] == [{"time": 104, "value": 16.0}]
 
 
 def test_non_finite_feature_is_skipped_without_breaking_valid_features(
