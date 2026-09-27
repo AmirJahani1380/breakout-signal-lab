@@ -365,7 +365,7 @@ class FeatureSetting:
             not isinstance(self.label, str)
             or not self.label.strip()
             or any(type(value) is not int for value in (self.minimum, self.default, self.maximum))
-            or not 1 <= self.minimum <= self.default <= self.maximum
+            or not 0 <= self.minimum <= self.default <= self.maximum
         ):
             raise ValueError(f"invalid setting {self.key!r} bounds or label")
         if not self.parameters or any(

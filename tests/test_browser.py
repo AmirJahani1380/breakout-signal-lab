@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from io import StringIO
+from io import BytesIO, StringIO
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from zipfile import ZipFile
@@ -31,6 +31,147 @@ def test_event_chart_overlay_matches_api_record(page: Page, viewer_url: str) -> 
         == record["broken_level"]
     )
     assert str(record["setup_id"]) in page.locator("#event-details").inner_text()
+
+
+def test_fixed_2r_chart_details_agree_with_downloaded_csv(
+    page: Page, viewer_url: str, tmp_path: Path
+) -> None:
+    page.goto(viewer_url)
+    page.locator("#symbol").select_option("BREAKOUT")
+    page.get_by_role("button", name="H1").click()
+    page.wait_for_function("document.querySelector('#chart').dataset.barCount === '7'")
+    page.get_by_role("tab", name="Events").click()
+    page.locator(".label-settings summary").click()
+    page.locator("#label-atr-period").fill("1")
+    page.locator("#label-atr-period").press("Tab")
+    page.locator("#label-horizon").fill("2")
+    page.locator("#label-horizon").press("Tab")
+    first = page.locator("#event-list button").first
+    first.wait_for()
+    first.click()
+    identifier = first.get_attribute("data-event-id")
+    assert identifier is not None
+    records = page.request.get(
+        f"{viewer_url}/api/v1/events?symbol=BREAKOUT&timeframe=H1"
+        "&label_atr_period=1&label_horizon=2"
+    ).json()["events"]
+    selected = next(record for record in records if record["id"] == identifier)
+    details = page.locator("#event-details").inner_text()
+    assert f"label {selected['label_status']}" in details
+    assert f"net {float(selected['net_r']):g}R" in details
+    assert (
+        page.locator("#chart").get_attribute("data-selected-label-status")
+        == selected["label_status"]
+    )
+    assert float(page.locator("#chart").get_attribute("data-selected-stop-price")) == pytest.approx(
+        selected["stop_price"]
+    )
+    assert float(
+        page.locator("#chart").get_attribute("data-selected-target-price")
+    ) == pytest.approx(selected["target_price"])
+
+    page.get_by_role("tab", name="Export").click()
+    while page.locator("#export-features input:checked").count():
+        page.locator("#export-features input:checked").first.uncheck()
+    for format in ("csv", "parquet"):
+        with page.expect_download() as transfer:
+            page.get_by_role("button", name=f"Download events {format.upper()}").click()
+        download = transfer.value
+        archive_path = tmp_path / download.suggested_filename
+        download.save_as(archive_path)
+        with ZipFile(archive_path) as archive:
+            frame = (
+                pd.read_csv(archive.open("encountered_events.csv"))
+                if format == "csv"
+                else pd.read_parquet(BytesIO(archive.read("encountered_events.parquet")))
+            )
+        row = frame.loc[frame["id"] == identifier].iloc[0]
+        assert row["label_status"] == selected["label_status"]
+        assert row["entry_fill"] == pytest.approx(selected["entry_fill"])
+        assert row["net_r"] == pytest.approx(selected["net_r"])
+        assert json.loads(row["label_config"])["horizon"] == 2
+        assert json.loads(row["label_config"])["atr_period"] == 1
+
+
+def test_label_settings_changed_during_backfill_refresh_chart_and_export(
+    page: Page, viewer_url: str, tmp_path: Path
+) -> None:
+    page.goto(viewer_url)
+    page.locator("#symbol").select_option("EURUSD")
+    page.get_by_role("button", name="H1").click()
+    page.wait_for_function("document.querySelector('#chart').dataset.barCount === '1000'")
+    page.get_by_role("tab", name="Events").click()
+    selected_id = page.locator("#event-list button").first.get_attribute("data-event-id")
+    assert selected_id is not None
+    held_pages: list[object] = []
+
+    def hold_older_events(route: object) -> None:
+        request = route.request  # type: ignore[attr-defined]
+        if "before" in parse_qs(urlparse(request.url).query):
+            held_pages.append(route)
+        else:
+            route.continue_()  # type: ignore[attr-defined]
+
+    page.route("**/api/v1/events?*", hold_older_events)
+    with page.expect_request(
+        lambda request: "/api/v1/events?" in request.url and "before=" in request.url
+    ):
+        page.evaluate(
+            "window.__breakoutChart.timeScale().setVisibleLogicalRange({from: 0, to: 20})"
+        )
+    page.wait_for_function("document.querySelector('#chart').dataset.barCount === '1000'")
+    page.wait_for_timeout(50)
+    assert len(held_pages) == 1
+
+    page.locator(".label-settings summary").click()
+    for selector, value in (
+        ("#label-atr-period", "1"),
+        ("#label-horizon", "2"),
+        ("#label-slippage", "0.1"),
+        ("#label-commission", "0.05"),
+    ):
+        control = page.locator(selector)
+        control.fill(value)
+        control.press("Tab")
+    page.wait_for_function(
+        "document.querySelector('#chart').dataset.barCount === '1000' && "
+        "document.querySelector('#event-list button') !== null"
+    )
+    held_pages[0].fulfill(json={"events": [], "swings": [], "has_more": False})  # type: ignore[attr-defined]
+    matching = page.locator(f'#event-list button[data-event-id="{selected_id}"]')
+    matching.click()
+    params = {
+        "symbol": "EURUSD",
+        "timeframe": "H1",
+        "label_atr_period": 1,
+        "label_horizon": 2,
+        "label_slippage": 0.1,
+        "label_commission": 0.05,
+    }
+    api_events = page.request.get(f"{viewer_url}/api/v1/events", params=params).json()["events"]
+    record = next(event for event in api_events if event["id"] == selected_id)
+    assert (
+        page.locator("#chart").get_attribute("data-selected-label-status") == record["label_status"]
+    )
+    assert float(page.locator("#chart").get_attribute("data-selected-stop-price")) == pytest.approx(
+        record["stop_price"]
+    )
+    assert f"entry {record['entry_fill']}" in page.locator("#event-details").inner_text()
+
+    page.get_by_role("tab", name="Export").click()
+    while page.locator("#export-features input:checked").count():
+        page.locator("#export-features input:checked").first.uncheck()
+    with page.expect_download() as transfer:
+        page.get_by_role("button", name="Download events CSV").click()
+    download = transfer.value
+    archive_path = tmp_path / download.suggested_filename
+    download.save_as(archive_path)
+    with ZipFile(archive_path) as archive:
+        frame = pd.read_csv(archive.open("encountered_events.csv"))
+    exported = frame.loc[frame["id"] == selected_id].iloc[0]
+    assert exported["label_status"] == record["label_status"]
+    assert exported["entry_fill"] == pytest.approx(record["entry_fill"])
+    assert json.loads(exported["label_config"])["slippage"] == 0.1
 
 
 def test_event_panel_keeps_chart_clear_and_filters_events(page: Page, viewer_url: str) -> None:

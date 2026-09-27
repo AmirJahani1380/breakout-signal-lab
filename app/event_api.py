@@ -18,6 +18,7 @@ from .bars import SourceCatalog, SourceValidationError, load_bars
 from .event_detectors import EventConfig, detect_events
 from .feature_export import FeatureExportError, build_feature_frame
 from .features.configuration import configure_features
+from .labels import LabelConfig, label_events
 
 EVENT_COLUMNS = (
     "id",
@@ -30,10 +31,52 @@ EVENT_COLUMNS = (
     "broken_level",
     "breakout_price",
     "reason",
+    "label_config",
+    "label_status",
+    "label_reason",
+    "entry_time",
+    "entry_open",
+    "entry_fill",
+    "signal_atr",
+    "stop_price",
+    "target_price",
+    "risk_price",
+    "planned_end_time",
+    "observation_end_time",
+    "exit_time",
+    "exit_fill",
+    "gross_r",
+    "net_r",
+    "horizon_complete",
+    "mae_price",
+    "mfe_price",
+    "mae_r",
+    "mfe_r",
 )
 
 
 def register_event_routes(app: FastAPI, source_timezone: str, page_size: int) -> None:
+    def label_configuration(request: Request) -> LabelConfig:
+        def integer(name: str, default: int) -> int:
+            raw = request.query_params.get(name, str(default))
+            if not raw.isdecimal() or str(int(raw)) != raw:
+                raise ValueError(f"{name} must be a positive integer")
+            return int(raw)
+
+        def number(name: str, default: float) -> float:
+            try:
+                return float(request.query_params.get(name, str(default)))
+            except ValueError as error:
+                raise ValueError(f"{name} must be a finite non-negative number") from error
+
+        return LabelConfig(
+            horizon=integer("label_horizon", 20),
+            atr_period=integer("label_atr_period", 20),
+            atr_buffer=number("label_atr_buffer", 0.05),
+            slippage=number("label_slippage", 0),
+            commission=number("label_commission", 0),
+        )
+
     def event_configuration(request: Request, detector_names: list[str]) -> EventConfig:
         def integer(name: str, default: int) -> int:
             raw = request.query_params.get(name, str(default))
@@ -104,8 +147,9 @@ def register_event_routes(app: FastAPI, source_timezone: str, page_size: int) ->
             )
             page = store.page(before, limit)
             times = {bar.time for bar in page.display_bars}
+            labeled = label_events(store.bars, detected, label_configuration(request))
             return {
-                "events": [event for event in detected if event["signal_time"] in times],
+                "events": [event for event in labeled if event["signal_time"] in times],
                 "swings": [
                     {
                         "direction": swing.direction,
@@ -151,10 +195,17 @@ def register_event_routes(app: FastAPI, source_timezone: str, page_size: int) ->
                 f"{symbol}/{timeframe}",
                 app.state.event_detectors,
             )
-            event_frame = pd.DataFrame.from_records(detected)
+            event_frame = pd.DataFrame.from_records(
+                label_events(store.bars, detected, label_configuration(request))
+            )
             if event_frame.empty:
                 event_frame = pd.DataFrame(columns=EVENT_COLUMNS)
             event_frame["configuration"] = event_frame["configuration"].map(
+                lambda value: (
+                    json.dumps(value, sort_keys=True) if isinstance(value, dict) else value
+                )
+            )
+            event_frame["label_config"] = event_frame["label_config"].map(
                 lambda value: (
                     json.dumps(value, sort_keys=True) if isinstance(value, dict) else value
                 )
@@ -178,7 +229,7 @@ def register_event_routes(app: FastAPI, source_timezone: str, page_size: int) ->
                 sidecar.write_text(
                     json.dumps(
                         {
-                            "schema": "encountered_events.v1",
+                            "schema": "encountered_events.v2",
                             "asset": symbol,
                             "timeframe": timeframe,
                             "detectors": detector_names,

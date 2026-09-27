@@ -161,7 +161,7 @@ def test_builtin_discovery_has_no_spurious_infrastructure_warning(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     caplog.set_level(logging.WARNING, logger="app.features")
-    assert len(discover()) == 16
+    assert len(discover()) == 18
     assert "Skipping feature module" not in caplog.text
 
 

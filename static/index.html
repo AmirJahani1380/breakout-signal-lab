@@ -129,6 +129,59 @@
                 value="0"
             /></label>
           </details>
+          <details class="label-settings">
+            <summary>Fixed 2R label settings</summary>
+            <label
+              >Holding bars
+              <input
+                id="label-horizon"
+                type="number"
+                min="1"
+                max="1000"
+                value="20"
+                required
+            /></label>
+            <label
+              >ATR period
+              <input
+                id="label-atr-period"
+                type="number"
+                min="1"
+                max="1000"
+                value="20"
+                required
+            /></label>
+            <label
+              >Stop buffer (ATR)
+              <input
+                id="label-atr-buffer"
+                type="number"
+                min="0"
+                step="any"
+                value="0.05"
+                required
+            /></label>
+            <label
+              >Slippage (price per fill)
+              <input
+                id="label-slippage"
+                type="number"
+                min="0"
+                step="any"
+                value="0"
+                required
+            /></label>
+            <label
+              >Commission (price per side)
+              <input
+                id="label-commission"
+                type="number"
+                min="0"
+                step="any"
+                value="0"
+                required
+            /></label>
+          </details>
           <p>
             <button id="previous-event" type="button">Previous</button>
             <button id="next-event" type="button">Next</button>
@@ -189,5 +242,6 @@
     </main>
     <script src="https://unpkg.com/lightweight-charts@5.2.0/dist/lightweight-charts.standalone.production.js"></script>
     <script src="/static/app.js"></script>
+    <script src="/static/ema_absolute_settings.js"></script>
   </body>
 </html>

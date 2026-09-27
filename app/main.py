@@ -6,7 +6,7 @@ import json
 import os
 import tempfile
 import zipfile
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from io import BytesIO
@@ -84,6 +84,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         yield
 
     app = FastAPI(title="Breakout Research Chart Viewer", lifespan=lifespan)
+
+    @app.middleware("http")
+    async def prevent_browser_cache(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        response = await call_next(request)
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
     @app.get("/api/v1/catalog")
     def catalog(

@@ -29,6 +29,15 @@ def market_root(tmp_path: Path, rows: list[tuple[object, ...]]) -> Path:
     return root
 
 
+def test_browser_responses_are_not_cached(tmp_path: Path) -> None:
+    with TestClient(create_app(Settings(tmp_path))) as client:
+        for path in ("/", "/static/app.js", "/static/style.css", "/api/v1/features"):
+            response = client.get(path)
+            assert response.status_code == 200
+            assert response.headers["cache-control"] == "no-store"
+        assert client.get("/api/v1/catalog").headers["cache-control"] == "no-store"
+
+
 def test_catalog_lists_filenames_without_loading_bars(
     tmp_path: Path,
 ) -> None:
@@ -265,6 +274,8 @@ def test_bars_include_backend_calculated_indicators(tmp_path: Path) -> None:
             "donchian_lower_20",
             "donchian_middle_20",
             "ema_20",
+            "ema_distance_20_atr_20",
+            "ema_slope_20_20_atr_20",
             "is_engulfing",
             "lower_wick_size",
             "lower_wick_to_atr_20",

@@ -170,13 +170,15 @@ const candles = chart.addSeries(LightweightCharts.CandlestickSeries, {
   wickUpColor: "#26a69a",
   wickDownColor: "#ef5350",
 });
-/** @typedef {{id:string,detector:string,configuration:Record<string, number>,direction:string,setup_id:string,signal_time:number,availability_time:number,broken_level:number|null,breakout_price:number,reason:string}} BreakoutEvent */
+/** @typedef {{id:string,detector:string,configuration:Record<string, number>,direction:string,setup_id:string,signal_time:number,availability_time:number,broken_level:number|null,breakout_price:number,reason:string,label_status:string,entry_time:number|null,entry_fill:number|null,stop_price:number|null,target_price:number|null,exit_time:number|null,exit_fill:number|null,gross_r:number|null,net_r:number|null,mae_r:number|null,mfe_r:number|null,horizon_complete:boolean}} BreakoutEvent */
 /** @type {BreakoutEvent[]} */
 let breakoutEvents = [];
 /** @type {string | null} */
 let selectedEventId = null;
 /** @type {any} */
 let selectedLevelLine = null;
+/** @type {any[]} */
+let selectedLabelLines = [];
 const breakoutMarkers = LightweightCharts.createSeriesMarkers(candles, []);
 
 function selectedDetectorIds() {
@@ -193,6 +195,18 @@ function addEventSettings(url, detectorIds = selectedDetectorIds()) {
   url.searchParams.set("swing_left", swingLeft.value);
   url.searchParams.set("swing_right", swingRight.value);
   url.searchParams.set("buffer", eventBuffer.value);
+  for (const name of [
+    "horizon",
+    "atr-period",
+    "atr-buffer",
+    "slippage",
+    "commission",
+  ]) {
+    const input = /** @type {HTMLInputElement} */ (
+      document.querySelector(`#label-${name}`)
+    );
+    url.searchParams.set(`label_${name.replaceAll("-", "_")}`, input.value);
+  }
   for (const input of Array.from(
     eventDetectors.querySelectorAll("input[data-detector-setting]"),
   )) {
@@ -216,6 +230,7 @@ function renderEventMarkers() {
       price: event.breakout_price,
       shape: event.direction === "bullish" ? "arrowUp" : "arrowDown",
       color: event.direction === "bullish" ? "#00c853" : "#ef5350",
+      text: event.label_status,
     }))
     .sort((left, right) => left.time - right.time);
   breakoutMarkers.setMarkers(markers);
@@ -269,10 +284,27 @@ function renderEventList() {
   const selected = breakoutEvents.find((event) => event.id === selectedEventId);
   if (selectedLevelLine) candles.removePriceLine(selectedLevelLine);
   selectedLevelLine = null;
+  for (const line of selectedLabelLines) candles.removePriceLine(line);
+  selectedLabelLines = [];
   eventDetails.textContent = selected
-    ? `${selected.reason}; setup ${selected.setup_id}${selected.broken_level === null ? "" : `; ${selected.detector === "swing_breakout" ? "confirmed pivot breakout level" : "broken level"} ${selected.broken_level}`}; signal ${new Date(selected.signal_time * 1000).toISOString()}; available ${new Date(selected.availability_time * 1000).toISOString()}`
+    ? `${selected.reason}; setup ${selected.setup_id}${selected.broken_level === null ? "" : `; ${selected.detector === "swing_breakout" ? "confirmed pivot breakout level" : "broken level"} ${selected.broken_level}`}; signal ${new Date(selected.signal_time * 1000).toISOString()}; available ${new Date(selected.availability_time * 1000).toISOString()}; label ${selected.label_status}; entry ${selected.entry_fill ?? "—"}; stop ${selected.stop_price ?? "—"}; target ${selected.target_price ?? "—"}; exit ${selected.exit_fill ?? "—"}; gross ${selected.gross_r ?? "—"}R; net ${selected.net_r ?? "—"}R; MAE ${selected.mae_r ?? "—"}R; MFE ${selected.mfe_r ?? "—"}R${selected.horizon_complete ? "" : " (partial horizon)"}`
     : "Select an event to inspect its signal.";
   if (selected) {
+    for (const [title, price, color] of [
+      ["2R stop", selected.stop_price, "#ef5350"],
+      ["2R target", selected.target_price, "#00c853"],
+    ]) {
+      if (price !== null)
+        selectedLabelLines.push(
+          candles.createPriceLine({
+            price,
+            color,
+            lineWidth: 1,
+            axisLabelVisible: true,
+            title,
+          }),
+        );
+    }
     if (selected.broken_level !== null)
       selectedLevelLine = candles.createPriceLine({
         price: selected.broken_level,
@@ -294,6 +326,11 @@ function renderEventList() {
   chartContainer.dataset.selectedEventId = selected?.id ?? "";
   chartContainer.dataset.selectedBrokenLevel =
     selected?.broken_level != null ? String(selected.broken_level) : "";
+  chartContainer.dataset.selectedLabelStatus = selected?.label_status ?? "";
+  chartContainer.dataset.selectedStopPrice =
+    selected?.stop_price != null ? String(selected.stop_price) : "";
+  chartContainer.dataset.selectedTargetPrice =
+    selected?.target_price != null ? String(selected.target_price) : "";
   renderEventMarkers();
 }
 
@@ -327,7 +364,15 @@ for (const input of [swingLookback, swingLeft, swingRight, eventBuffer])
   input.addEventListener("change", () => {
     if (!input.reportValidity()) return;
     if (activeSelection)
-      selectTimeframe(activeSelection.symbol, activeSelection.timeframe);
+      selectTimeframe(activeSelection.symbol, activeSelection.timeframe, true);
+  });
+for (const input of Array.from(
+  document.querySelectorAll(".label-settings input"),
+))
+  input.addEventListener("change", () => {
+    if (!(input instanceof HTMLInputElement) || !input.reportValidity()) return;
+    if (activeSelection)
+      selectTimeframe(activeSelection.symbol, activeSelection.timeframe, true);
   });
 
 /**
@@ -878,9 +923,10 @@ function renderTimeframes(symbol) {
   }
 }
 
-/** @param {string} symbol @param {string} timeframe */
-function selectTimeframe(symbol, timeframe) {
+/** @param {string} symbol @param {string} timeframe @param {boolean} [force] */
+function selectTimeframe(symbol, timeframe, force = false) {
   if (
+    !force &&
     loading &&
     activeSelection?.symbol === symbol &&
     activeSelection.timeframe === timeframe
@@ -986,6 +1032,7 @@ async function loadCatalog(previousStates = new Map()) {
               selectTimeframe(
                 activeSelection.symbol,
                 activeSelection.timeframe,
+                true,
               );
           });
         label.append(checkbox, ` ${detector.label}`);
@@ -1008,6 +1055,7 @@ async function loadCatalog(previousStates = new Map()) {
                 selectTimeframe(
                   activeSelection.symbol,
                   activeSelection.timeframe,
+                  true,
                 );
             });
             settingLabel.append(` ${setting.label} `, settingInput);
