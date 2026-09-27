@@ -19,7 +19,15 @@ from app.main import Settings, create_app
 
 def bars_from_closes(closes: list[float]) -> tuple[Bar, ...]:
     return tuple(
-        Bar(index + 1, close, close + 1, close - 1, close, 1) for index, close in enumerate(closes)
+        Bar(
+            index + 1,
+            closes[index - 1] if index else close,
+            max(close + 1, closes[index - 1] if index else close),
+            min(close - 1, closes[index - 1] if index else close),
+            close,
+            1,
+        )
+        for index, close in enumerate(closes)
     )
 
 
@@ -27,17 +35,21 @@ def test_ema_close_crossings_and_equal_boundary() -> None:
     bars = bars_from_closes([10, 12, 8, 8, 11])
     events, _ = detect_events(bars, EventConfig(ema_period=2), ["ema_breakout"])
     assert [(event["direction"], event["signal_time"]) for event in events] == [
+        ("bullish", 2),
         ("bearish", 3),
         ("bullish", 5),
     ]
-    assert events[0]["broken_level"] == pytest.approx(9.11111111111111)
+    assert events[0]["broken_level"] == pytest.approx(11.333333333333334)
+    assert events[1]["broken_level"] == pytest.approx(9.11111111111111)
     equal, _ = detect_events(
-        bars_from_closes([10, 10, 11]), EventConfig(ema_period=2), ["ema_breakout"]
+        (Bar(1, 10, 11, 9, 10, 1), Bar(2, 11, 12, 10, 11, 1)),
+        EventConfig(ema_period=1),
+        ["ema_breakout"],
     )
     assert equal == ()
 
 
-def test_ema_ignores_gap_and_wick_then_rearms_on_reversal() -> None:
+def test_ema_open_close_crossing_and_reversal() -> None:
     initial = bars_from_closes([10, 12])
     gap_and_wick = Bar(3, 8, 13, 7, 12, 1)
     reversal = Bar(4, 8, 9, 7, 8, 1)
@@ -47,8 +59,8 @@ def test_ema_ignores_gap_and_wick_then_rearms_on_reversal() -> None:
         ["ema_breakout"],
     )
     assert [(event["direction"], event["signal_time"]) for event in events] == [
-        ("bearish", 4),
-        ("bullish", 5),
+        ("bullish", 2),
+        ("bullish", 3),
     ]
     repeated, _ = detect_events(
         bars_from_closes([10, 12, 8, 12, 8]),
@@ -56,6 +68,7 @@ def test_ema_ignores_gap_and_wick_then_rearms_on_reversal() -> None:
         ["ema_breakout"],
     )
     assert [(event["direction"], event["signal_time"]) for event in repeated] == [
+        ("bullish", 2),
         ("bearish", 3),
         ("bullish", 4),
         ("bearish", 5),
@@ -95,17 +108,54 @@ def test_swing_confirmation_ties_and_strict_next_bar_eligibility() -> None:
     assert buffered == ()
 
 
-def test_swing_ignores_gap_and_wick_and_rearms_after_return_inside_channel() -> None:
+def test_hand_calculated_rolling_swing_breakouts_and_expiry() -> None:
+    bullish_bars = (
+        Bar(1, 8, 9, 7, 8, 1),
+        Bar(2, 10, 12, 9, 10, 1),  # high pivot 12
+        Bar(3, 8, 10, 7, 8, 1),  # confirms pivot 2
+        Bar(4, 8, 14, 8, 13, 1),  # opens below 12 and closes above 12
+    )
+    bearish_bars = (
+        Bar(1, 14, 15, 13, 14, 1),
+        Bar(2, 11, 13, 9, 11, 1),  # low pivot 9
+        Bar(3, 12, 14, 10, 12, 1),  # confirms pivot 2
+        Bar(4, 12, 13, 8, 8, 1),  # opens above 9 and closes below 9
+    )
+    config = EventConfig(swing_left=1, swing_right=1, swing_lookback=2)
+    bullish, _ = detect_events(bullish_bars, config, ["swing_breakout"])
+    bearish, _ = detect_events(bearish_bars, config, ["swing_breakout"])
+    assert [(e["direction"], e["broken_level"], e["setup_id"]) for e in bullish] == [
+        ("bullish", 12, "high:2")
+    ]
+    assert [(e["direction"], e["broken_level"], e["setup_id"]) for e in bearish] == [
+        ("bearish", 9, "low:2")
+    ]
+    expired = EventConfig(swing_left=1, swing_right=1, swing_lookback=1)
+    assert detect_events(bullish_bars, expired, ["swing_breakout"])[0] == ()
+    assert detect_events(bearish_bars, expired, ["swing_breakout"])[0] == ()
+    assert (
+        detect_events((*bullish_bars[:3], Bar(4, 12, 14, 8, 13, 1)), config, ["swing_breakout"])[0]
+        == ()
+    )
+    assert (
+        detect_events((*bearish_bars[:3], Bar(4, 12, 13, 8, 9, 1)), config, ["swing_breakout"])[0]
+        == ()
+    )
+
+
+def test_swing_requires_open_and_close_on_opposite_sides() -> None:
     first_five = bars_from_closes([8, 9, 12, 9, 8])
     for opening in (8, 14):
         crossing_attempt = Bar(6, opening, 15, 7, 12, 1)
-        crossing_close = Bar(7, 14, 15, 13, 14, 1)
+        crossing_close = Bar(7, 12 if opening == 8 else 14, 15, 11, 14, 1)
         events, _ = detect_events(
             (*first_five, crossing_attempt, crossing_close),
             EventConfig(swing_left=2, swing_right=2),
             ["swing_breakout"],
         )
-        assert [(event["setup_id"], event["signal_time"]) for event in events] == [("high:3", 7)]
+        assert [(event["setup_id"], event["signal_time"]) for event in events] == (
+            [("high:3", 7)] if opening == 8 else []
+        )
     repeated, _ = detect_events(
         bars_from_closes([8, 9, 12, 9, 8, 14, 8, 14]),
         EventConfig(swing_left=2, swing_right=2),
@@ -117,30 +167,33 @@ def test_swing_ignores_gap_and_wick_and_rearms_after_return_inside_channel() -> 
     ]
 
 
-def test_indexed_swing_crossings_match_close_rule_on_varied_prices() -> None:
+def test_indexed_swing_crossings_match_rolling_open_close_rule_on_varied_prices() -> None:
     generator = random.Random(19)
     bars = bars_from_closes([float(generator.randrange(8, 32)) for _ in range(600)])
     config = EventConfig(swing_left=2, swing_right=2, buffer=0.5)
     actual, swings = detect_events(bars, config, ["swing_breakout"])
     expected: list[tuple[str, int]] = []
-    upper = None
-    lower = None
-    next_swing = 0
-    for previous, current in zip(bars, bars[1:]):
-        while next_swing < len(swings) and swings[next_swing].availability_time <= previous.time:
-            swing = swings[next_swing]
-            if swing.direction == "high" and (upper is None or swing.level > upper.level):
-                upper = swing
-            elif swing.direction == "low" and (lower is None or swing.level < lower.level):
-                lower = swing
-            next_swing += 1
+    positions = {bar.time: index for index, bar in enumerate(bars)}
+    for index, current in enumerate(bars[1:], start=1):
+        eligible = [
+            swing
+            for swing in swings
+            if index - config.swing_lookback <= positions[swing.pivot_time] < index
+            and positions[swing.availability_time] < index
+        ]
+        upper = max(
+            (s for s in eligible if s.direction == "high"), key=lambda s: s.level, default=None
+        )
+        lower = min(
+            (s for s in eligible if s.direction == "low"), key=lambda s: s.level, default=None
+        )
         if upper is not None and (
-            previous.close < upper.level - config.buffer
+            current.open < upper.level - config.buffer
             and current.close > upper.level + config.buffer
         ):
             expected.append((f"high:{upper.pivot_time}", current.time))
         if lower is not None and (
-            previous.close > lower.level + config.buffer
+            current.open > lower.level + config.buffer
             and current.close < lower.level - config.buffer
         ):
             expected.append((f"low:{lower.pivot_time}", current.time))
@@ -167,16 +220,18 @@ def test_drop_in_detector_is_discovered_and_exposed_without_other_code_changes(
     module_path = tmp_path / "custom_rising.py"
     module_path.write_text(
         """from app.bars import Bar
-from app.event_detectors import Event, EventConfig, EventDetector, make_event
+from app.event_detectors import DetectorSetting, Event, EventConfig, EventDetector, make_event
 from collections.abc import Sequence
 
 def detect(bars: Sequence[Bar], config: EventConfig, dataset_id: str) -> tuple[Event, ...]:
-    if len(bars) < 2 or bars[-1].close <= bars[-2].close:
+    minimum_rise = config.detector_settings["custom_rising.minimum_rise"]
+    if len(bars) < 2 or bars[-1].close - bars[-2].close <= minimum_rise:
         return ()
     return (make_event("custom_rising", "bullish", bars[-1], bars[-2].close,
-                       "last_close", bars[-1].time, {}, dataset_id),)
+                       "last_close", bars[-1].time, {"minimum_rise": minimum_rise}, dataset_id),)
 
-detector = EventDetector("custom_rising", "Custom rising close", detect)
+detector = EventDetector("custom_rising", "Custom rising close", detect,
+                         (DetectorSetting("minimum_rise", "Minimum rise", 0, minimum=0),))
 """,
         encoding="utf-8",
     )
@@ -194,10 +249,95 @@ detector = EventDetector("custom_rising", "Custom rising close", detect)
             "/api/v1/events",
             params={"symbol": "RISING", "timeframe": "H1", "detectors": "custom_rising"},
         )
+        filtered = client.get(
+            "/api/v1/events",
+            params={
+                "symbol": "RISING",
+                "timeframe": "H1",
+                "detectors": "custom_rising",
+                "custom_rising.minimum_rise": 2,
+            },
+        )
+        invalid = client.get(
+            "/api/v1/events",
+            params={
+                "symbol": "RISING",
+                "timeframe": "H1",
+                "detectors": "custom_rising",
+                "custom_rising.minimum_rise": -1,
+            },
+        )
+        empty = client.get(
+            "/api/v1/events",
+            params={
+                "symbol": "RISING",
+                "timeframe": "H1",
+                "detectors": "custom_rising",
+                "custom_rising.minimum_rise": "",
+            },
+        )
 
     assert {detector["id"] for detector in catalog} >= {"custom_rising"}
     assert response.status_code == 200
     assert response.json()["events"][0]["detector"] == "custom_rising"
+    assert filtered.status_code == 200 and filtered.json()["events"] == []
+    assert invalid.status_code == 422
+    assert "custom_rising.minimum_rise" in invalid.json()["detail"]
+    assert empty.status_code == 422
+    assert "custom_rising.minimum_rise" in empty.json()["detail"]
+    assert next(entry for entry in catalog if entry["id"] == "custom_rising")["settings"] == [
+        {
+            "name": "custom_rising.minimum_rise",
+            "label": "Minimum rise",
+            "default": 0,
+            "min": 0,
+            "max": None,
+        }
+    ]
+
+
+def test_three_bullish_candles_signals_once_per_run_and_is_auto_exposed(tmp_path: Path) -> None:
+    root = tmp_path / "market"
+    root.mkdir()
+    source = root / "RISING_H1.csv"
+    source.write_text(
+        "time,open,high,low,close,volume\n"
+        + "".join(
+            f"{time},{opening},{max(opening, closing) + 1},"
+            f"{min(opening, closing) - 1},{closing},1\n"
+            for time, (opening, closing) in enumerate(
+                [(1, 2), (2, 3), (3, 4), (4, 5), (5, 5), (5, 6), (6, 7), (7, 8)],
+                start=1,
+            )
+        ),
+        encoding="utf-8",
+    )
+    with TestClient(create_app(Settings(root))) as client:
+        catalog = client.get("/api/v1/features").json()["event_detectors"]
+        response = client.get(
+            "/api/v1/events",
+            params={"symbol": "RISING", "timeframe": "H1", "detectors": "three_bullish_candles"},
+        )
+        exported = client.get(
+            "/api/v1/events/export",
+            params={
+                "symbol": "RISING",
+                "timeframe": "H1",
+                "detectors": "three_bullish_candles",
+                "format": "csv",
+            },
+        )
+    assert "three_bullish_candles" in {entry["id"] for entry in catalog}
+    assert response.status_code == 200
+    events = response.json()["events"]
+    assert [event["signal_time"] for event in events] == [3, 8]
+    assert all(event["broken_level"] is None for event in events)
+    assert [event["reason"] for event in events] == ["three consecutive bullish candles"] * 2
+    assert exported.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(exported.content)) as archive:
+        frame = pd.read_csv(archive.open("encountered_events.csv"))
+    assert frame["id"].tolist() == [event["id"] for event in events]
+    assert frame["broken_level"].isna().all()
 
 
 @pytest.mark.parametrize(

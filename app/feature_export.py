@@ -142,7 +142,7 @@ def export_bar_features(
     asset: str,
     timeframe: str,
     feature_names: Sequence[str],
-    format: Literal["csv", "parquet"],
+    format: Literal["csv", "parquet"],  # pylint: disable=redefined-builtin
     source_timezone: str = "UTC",
     definitions: Sequence[FeatureDefinition] | None = None,
 ) -> tuple[Path, Path]:

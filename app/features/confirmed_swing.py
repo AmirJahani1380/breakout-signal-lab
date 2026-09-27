@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 from app.bars import Bar
 
-from . import FeatureDefinition, FeatureSpec, FeatureTable, FeatureViewSpec
+from . import FeatureDefinition, FeatureSetting, FeatureSpec, FeatureTable, FeatureViewSpec
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,45 +38,70 @@ def confirmed_swings(
     return tuple(swings)
 
 
-_HIGH = FeatureSpec("confirmed_swing_high_3_3", "Float64", {"left": 3, "right": 3})
-_LOW = FeatureSpec("confirmed_swing_low_3_3", "Float64", {"left": 3, "right": 3})
+def make_feature(period: int = 3) -> FeatureDefinition:
+    if type(period) is not int or not 1 <= period <= 100:
+        raise ValueError("swing period must be an integer between 1 and 100")
+    high = FeatureSpec(
+        f"confirmed_swing_high_{period}_{period}",
+        "Float64",
+        {"left": period, "right": period},
+        selection_key="confirmed_swing_high",
+    )
+    low = FeatureSpec(
+        f"confirmed_swing_low_{period}_{period}",
+        "Float64",
+        {"left": period, "right": period},
+        selection_key="confirmed_swing_low",
+    )
 
+    def calculate(bars: Sequence[Bar]) -> FeatureTable:
+        positions = {bar.time: index for index, bar in enumerate(bars)}
+        highs: list[float | None] = [None] * len(bars)
+        lows: list[float | None] = [None] * len(bars)
+        for swing in confirmed_swings(bars, period, period):
+            target = highs if swing.direction == "high" else lows
+            target[positions[swing.availability_time]] = swing.level
+        return FeatureTable.from_columns(
+            (high, low),
+            [bar.time for bar in bars],
+            {high.name: highs, low.name: lows},
+        )
 
-def calculate(bars: Sequence[Bar]) -> FeatureTable:
-    positions = {bar.time: index for index, bar in enumerate(bars)}
-    highs: list[float | None] = [None] * len(bars)
-    lows: list[float | None] = [None] * len(bars)
-    for swing in confirmed_swings(bars):
-        target = highs if swing.direction == "high" else lows
-        target[positions[swing.availability_time]] = swing.level
-    return FeatureTable.from_columns(
-        (_HIGH, _LOW),
-        [bar.time for bar in bars],
-        {_HIGH.name: highs, _LOW.name: lows},
+    return FeatureDefinition(
+        (high, low),
+        calculate,
+        (
+            FeatureViewSpec(
+                f"confirmed_swing_{period}_{period}",
+                high.name,
+                f"Confirmed swings {period}/{period}",
+                "Red dots show confirmed swing highs and lows on their pivot candles",
+                "marker",
+                show_in_crosshair=False,
+                series_options={
+                    "position": "atPriceMiddle",
+                    "shape": "circle",
+                    "color": "#ef5350",
+                    "size": 1,
+                },
+                marker_features=(low.name,),
+                marker_offset_bars=-period,
+                selection_key="confirmed_swing",
+            ),
+        ),
+        calculation_warm_up=period * 2,
+        calculation_look_ahead=period,
+        settings=(
+            FeatureSetting(
+                "swing_period", "Swing period", 3, maximum=100, parameters=("left", "right")
+            ),
+        ),
+        configure=lambda values: make_feature(values["swing_period"]),
     )
 
 
-feature = FeatureDefinition(
-    (_HIGH, _LOW),
-    calculate,
-    (
-        FeatureViewSpec(
-            "confirmed_swing_3_3",
-            _HIGH.name,
-            "Confirmed swings 3/3",
-            "Red dots show confirmed swing highs and lows on their pivot candles",
-            "marker",
-            show_in_crosshair=False,
-            series_options={
-                "position": "atPriceMiddle",
-                "shape": "circle",
-                "color": "#ef5350",
-                "size": 1,
-            },
-            marker_features=(_LOW.name,),
-            marker_offset_bars=-3,
-        ),
-    ),
-    calculation_warm_up=6,
-    calculation_look_ahead=3,
-)
+feature = make_feature()
+
+
+def calculate(bars: Sequence[Bar]) -> FeatureTable:
+    return feature.calculate(bars)

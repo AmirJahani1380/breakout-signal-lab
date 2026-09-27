@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from bisect import bisect_left
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -202,7 +203,7 @@ def load_stored_dataset(path: Path) -> StoredDataset:
                     raise ValueError(f"{spec.name}: expected boolean True/False or null")
                 values = values.map({True: True, False: False, "True": True, "False": False})
             elif spec.dtype == "Int64":
-                values = values.map(lambda value: _stored_integer(value, spec.name))
+                values = values.map(partial(_stored_integer, name=spec.name))
             else:
                 values = values.map(lambda value: pd.NA if pd.isna(value) else float(value))
             columns[spec.name] = values.tolist()

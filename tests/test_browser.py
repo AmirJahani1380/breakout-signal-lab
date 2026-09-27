@@ -17,7 +17,7 @@ def test_event_chart_overlay_matches_api_record(page: Page, viewer_url: str) -> 
     page.get_by_role("button", name="H1").click()
     page.wait_for_function("document.querySelector('#chart').dataset.barCount === '1000'")
     page.get_by_role("tab", name="Events").click()
-    first = page.locator("#event-list button").first
+    first = page.locator("#event-list button").filter(has_text="ema_breakout").first
     first.wait_for()
     identifier = first.get_attribute("data-event-id")
     first.click()
@@ -31,6 +31,77 @@ def test_event_chart_overlay_matches_api_record(page: Page, viewer_url: str) -> 
         == record["broken_level"]
     )
     assert str(record["setup_id"]) in page.locator("#event-details").inner_text()
+
+
+def test_swing_breakouts_and_donchian_channel_in_browser(page: Page, viewer_url: str) -> None:
+    page.goto(viewer_url)
+    page.locator("#symbol").select_option("BREAKOUT")
+    page.get_by_role("button", name="H1").click()
+    page.wait_for_function("document.querySelector('#chart').dataset.barCount === '7'")
+    page.get_by_role("tab", name="Events").click()
+    for selector, value in (("#swing-left", "1"), ("#swing-right", "1"), ("#swing-lookback", "2")):
+        control = page.locator(selector)
+        control.fill(value)
+        control.press("Tab")
+    page.wait_for_function(
+        "[...document.querySelectorAll('#event-list button')].filter(button => "
+        "button.textContent.includes('swing_breakout')).length === 2"
+    )
+    page.wait_for_load_state("networkidle")
+    swing_events = page.locator("#event-list button").filter(has_text="swing_breakout")
+    assert swing_events.count() == 2
+    swing_events.first.click()
+    page.wait_for_function("document.querySelector('#chart').dataset.selectedBrokenLevel === '12'")
+    page.get_by_role("tab", name="Indicators").click()
+    swing = page.locator('[data-indicator="confirmed_swing_3_3"]')
+    swing.locator('[data-period="swing_period"]').fill("1")
+    swing.locator('[data-period="swing_period"]').press("Tab")
+    page.locator('[data-indicator="confirmed_swing_1_1"]').wait_for()
+    page.wait_for_function(
+        "document.querySelector('#chart').dataset.barCount === '7' && "
+        "document.querySelector('#state').textContent === ''"
+    )
+    page.locator('[data-indicator="confirmed_swing_1_1"] [data-apply]').check()
+    page.wait_for_function("Number(document.querySelector('#chart').dataset.markerCount) > 0")
+    period = page.locator('[data-indicator="donchian_upper_20"] [data-period="donchian_period"]')
+    period.fill("3")
+    period.press("Tab")
+    page.locator('[data-indicator="donchian_upper_3"]').wait_for()
+    for edge in ("upper", "lower", "middle"):
+        page.locator(f'[data-indicator="donchian_{edge}_3"] [data-apply]').check()
+    page.wait_for_function(
+        "window.__breakoutChart.panes()[0].getSeries().length === 5 && "
+        "window.__breakoutChart.panes()[0].getSeries().slice(-3).every(s => s.data().length > 0)"
+    )
+    series = page.evaluate(
+        "window.__breakoutChart.panes()[0].getSeries().slice(-3).map(s => s.data().at(-1).value)"
+    )
+    assert sorted(series) == [6, 9.5, 13]
+
+
+def test_level_free_event_has_marker_without_broken_level_line(page: Page, viewer_url: str) -> None:
+    page.goto(viewer_url)
+    page.locator("#symbol").select_option("CANDLES")
+    page.get_by_role("button", name="H1").click()
+    page.wait_for_function("document.querySelector('#chart').dataset.barCount === '7'")
+    page.get_by_role("tab", name="Events").click()
+    candle_event = page.locator("#event-list button").filter(has_text="three_bullish_candles").first
+    candle_event.click()
+    assert page.locator("#chart").get_attribute("data-selected-broken-level") == ""
+    assert "broken level" not in page.locator("#event-details").inner_text()
+    assert int(page.locator("#chart").get_attribute("data-event-marker-count")) > 0
+    setting = page.locator('input[data-detector-setting="three_bullish_candles.minimum_body"]')
+    assert setting.count() == 1
+    setting.fill("")
+    setting.dispatch_event("change")
+    assert setting.evaluate("input => input.validity.valueMissing")
+    assert page.locator("#chart").get_attribute("data-bar-count") == "7"
+    assert candle_event.is_visible()
+    setting.fill("2")
+    setting.dispatch_event("change")
+    page.wait_for_function(
+        "!document.querySelector('#event-list').textContent.includes('three_bullish_candles')"
+    )
 
 
 def test_swing_indicator_controls_pivot_dots_on_the_chart(page: Page, viewer_url: str) -> None:

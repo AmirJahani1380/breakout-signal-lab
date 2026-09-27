@@ -14,20 +14,18 @@ def detect(bars: Sequence[Bar], config: EventConfig, dataset_id: str) -> tuple[E
     events: list[Event] = []
     previous_ema: float | None = None
     configuration = {"ema_period": config.ema_period, "buffer": config.buffer}
-    for index, bar in enumerate(bars):
+    for bar in bars:
         current_ema = ema_step(previous_ema, bar.close, config.ema_period)
-        if index:
-            previous_close = bars[index - 1].close
-            assert previous_ema is not None
+        if previous_ema is not None:
             crossings: tuple[tuple[Direction, bool], ...] = (
                 (
                     "bullish",
-                    previous_close < previous_ema - config.buffer
+                    bar.open < current_ema - config.buffer
                     and bar.close > current_ema + config.buffer,
                 ),
                 (
                     "bearish",
-                    previous_close > previous_ema + config.buffer
+                    bar.open > current_ema + config.buffer
                     and bar.close < current_ema - config.buffer,
                 ),
             )

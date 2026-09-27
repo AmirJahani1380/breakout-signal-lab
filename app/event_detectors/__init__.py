@@ -9,6 +9,7 @@ import pkgutil
 import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from hashlib import sha256
 from math import isfinite
 from typing import Literal, cast
@@ -25,15 +26,17 @@ Direction = Literal["bullish", "bearish"]
 @dataclass(frozen=True, slots=True)
 class EventConfig:
     ema_period: int = 20
+    swing_lookback: int = 20
     swing_left: int = 3
     swing_right: int = 3
     buffer: float = 0.0
+    detector_settings: Mapping[str, float] = dataclass_field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        for name in ("ema_period", "swing_left", "swing_right"):
+        for name in ("ema_period", "swing_lookback", "swing_left", "swing_right"):
             value = getattr(self, name)
-            maximum = 1000 if name == "ema_period" else 100
-            if type(value) is not int or not 1 <= value <= maximum:
+            maximum = 1000 if name in ("ema_period", "swing_lookback") else 100
+            if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= maximum:
                 raise ValueError(f"{name} must be an integer between 1 and {maximum}")
         if (
             isinstance(self.buffer, bool)
@@ -48,12 +51,38 @@ DetectFunction = Callable[[Sequence[Bar], EventConfig, str], Sequence[Event]]
 
 
 @dataclass(frozen=True, slots=True)
+class DetectorSetting:
+    name: str
+    label: str
+    default: float
+    minimum: float | None = None
+    maximum: float | None = None
+
+    def __post_init__(self) -> None:
+        if not DETECTOR_ID_PATTERN.fullmatch(self.name):
+            raise ValueError(
+                "detector setting name must use lowercase letters, numbers, or underscores"
+            )
+        if not self.label.strip():
+            raise ValueError("detector setting label must not be empty")
+        if not isfinite(self.default) or any(
+            bound is not None and not isfinite(bound) for bound in (self.minimum, self.maximum)
+        ):
+            raise ValueError("detector setting values must be finite")
+        if self.minimum is not None and self.default < self.minimum:
+            raise ValueError("detector setting default is below minimum")
+        if self.maximum is not None and self.default > self.maximum:
+            raise ValueError("detector setting default is above maximum")
+
+
+@dataclass(frozen=True, slots=True)
 class EventDetector:
     """A detector module's stable identifier, UI label, and event calculation."""
 
     identifier: str
     label: str
     detect: DetectFunction
+    settings: tuple[DetectorSetting, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.identifier, str) or not DETECTOR_ID_PATTERN.fullmatch(
@@ -66,17 +95,20 @@ class EventDetector:
             raise ValueError("detector label must not be empty")
         if not callable(self.detect):
             raise ValueError("detector detect must be callable")
+        if len({setting.name for setting in self.settings}) != len(self.settings):
+            raise ValueError("detector setting names must be unique")
 
 
 def make_event(
     detector: str,
     direction: Direction,
     signal: Bar,
-    broken_level: float,
+    broken_level: float | None,
     setup_id: str,
     availability_time: int,
     configuration: Mapping[str, object],
     dataset_id: str = "",
+    reason: str | None = None,
 ) -> Event:
     """Build the shared event response shape and deterministic event ID."""
     if direction not in ("bullish", "bearish"):
@@ -109,9 +141,8 @@ def make_event(
         "availability_time": availability_time,
         "broken_level": broken_level,
         "breakout_price": signal.close,
-        "reason": (
-            f"close crossed {'above' if direction == 'bullish' else 'below'} {detector} level"
-        ),
+        "reason": reason
+        or f"candle crossed {'above' if direction == 'bullish' else 'below'} {detector} level",
     }
 
 
@@ -126,7 +157,8 @@ def discover_detectors() -> dict[str, EventDetector]:
                 raise ValueError("module must export an EventDetector named 'detector'")
             if detector.identifier in discovered:
                 raise ValueError(f"duplicate detector identifier {detector.identifier!r}")
-        except Exception as error:
+        # A drop-in module can fail with any exception during import; keep other detectors usable.
+        except Exception as error:  # pylint: disable=broad-exception-caught
             logger.warning("Skipping event detector module %s: %s", module_info.name, error)
             continue
         discovered[detector.identifier] = detector
@@ -163,12 +195,22 @@ def _validated_event(
         raise ValueError(f"{prefix} direction must be bullish or bearish")
     signal_time = candidate["signal_time"]
     availability_time = candidate["availability_time"]
-    if type(signal_time) is not int or signal_time not in closes:
+    if (
+        isinstance(signal_time, bool)
+        or not isinstance(signal_time, int)
+        or signal_time not in closes
+    ):
         raise ValueError(f"{prefix} signal_time must identify a source bar")
-    if type(availability_time) is not int or availability_time > signal_time:
+    if (
+        isinstance(availability_time, bool)
+        or not isinstance(availability_time, int)
+        or availability_time > signal_time
+    ):
         raise ValueError(f"{prefix} availability_time must be no later than signal_time")
     for field in ("broken_level", "breakout_price"):
         number = candidate[field]
+        if field == "broken_level" and number is None:
+            continue
         if isinstance(number, bool) or not isinstance(number, (int, float)) or not isfinite(number):
             raise ValueError(f"{prefix} {field} must be a finite number")
     if candidate["breakout_price"] != closes[signal_time]:

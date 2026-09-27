@@ -86,10 +86,36 @@ def viewer_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
     )
     pivot_closes = [6, 8, 10, 12, 10, 8, 6, 4, 6, 8, 6]
     write_csv(
+        root / "BREAKOUT_H1.csv",
+        [
+            (1_735_700_000 + index * 60, opening, high, low, close, 1)
+            for index, (opening, high, low, close) in enumerate(
+                [
+                    (8, 9, 7, 8),
+                    (10, 12, 9, 10),
+                    (8, 10, 7, 8),
+                    (8, 14, 8, 13),
+                    (11, 12, 7, 10),
+                    (11, 13, 9, 11),
+                    (11, 12, 6, 6),
+                ]
+            )
+        ],
+    )
+    write_csv(
         root / "PIVOT_H1.csv",
         [
             (1_735_689_600 + index * 60, close, close + 1, close - 1, close, 1)
             for index, close in enumerate(pivot_closes)
+        ],
+    )
+    write_csv(
+        root / "CANDLES_H1.csv",
+        [
+            (1_735_689_600 + index * 60, opening, closing + 1, opening - 1, closing, 1)
+            for index, (opening, closing) in enumerate(
+                [(1, 2), (2, 3), (3, 4), (4, 4), (4, 5), (5, 6), (6, 7)]
+            )
         ],
     )
     port = free_port()

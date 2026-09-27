@@ -37,6 +37,9 @@ const exportEventDetectors = /** @type {HTMLElement} */ (
 const swingLeft = /** @type {HTMLInputElement} */ (
   document.querySelector("#swing-left")
 );
+const swingLookback = /** @type {HTMLInputElement} */ (
+  document.querySelector("#swing-lookback")
+);
 const swingRight = /** @type {HTMLInputElement} */ (
   document.querySelector("#swing-right")
 );
@@ -156,7 +159,7 @@ const candles = chart.addSeries(LightweightCharts.CandlestickSeries, {
   wickUpColor: "#26a69a",
   wickDownColor: "#ef5350",
 });
-/** @typedef {{id:string,detector:string,configuration:Record<string, number>,direction:string,setup_id:string,signal_time:number,availability_time:number,broken_level:number,breakout_price:number,reason:string}} BreakoutEvent */
+/** @typedef {{id:string,detector:string,configuration:Record<string, number>,direction:string,setup_id:string,signal_time:number,availability_time:number,broken_level:number|null,breakout_price:number,reason:string}} BreakoutEvent */
 /** @type {BreakoutEvent[]} */
 let breakoutEvents = [];
 /** @type {string | null} */
@@ -172,12 +175,20 @@ function selectedDetectorIds() {
   );
 }
 
-/** @param {URL} url */
-function addEventSettings(url) {
-  url.searchParams.set("detectors", selectedDetectorIds().join(","));
+/** @param {URL} url @param {string[]} detectorIds */
+function addEventSettings(url, detectorIds = selectedDetectorIds()) {
+  url.searchParams.set("detectors", detectorIds.join(","));
+  url.searchParams.set("swing_lookback", swingLookback.value);
   url.searchParams.set("swing_left", swingLeft.value);
   url.searchParams.set("swing_right", swingRight.value);
   url.searchParams.set("buffer", eventBuffer.value);
+  for (const input of Array.from(
+    eventDetectors.querySelectorAll("input[data-detector-setting]"),
+  )) {
+    const setting = /** @type {HTMLInputElement} */ (input);
+    if (setting.dataset.detectorSetting)
+      url.searchParams.set(setting.dataset.detectorSetting, setting.value);
+  }
 }
 
 function renderEventMarkers() {
@@ -217,16 +228,17 @@ function renderEventList() {
   if (selectedLevelLine) candles.removePriceLine(selectedLevelLine);
   selectedLevelLine = null;
   eventDetails.textContent = selected
-    ? `${selected.reason}; setup ${selected.setup_id}; broken level ${selected.broken_level}; signal ${new Date(selected.signal_time * 1000).toISOString()}; available ${new Date(selected.availability_time * 1000).toISOString()}`
+    ? `${selected.reason}; setup ${selected.setup_id}${selected.broken_level === null ? "" : `; broken level ${selected.broken_level}`}; signal ${new Date(selected.signal_time * 1000).toISOString()}; available ${new Date(selected.availability_time * 1000).toISOString()}`
     : `${visible.length} loaded events`;
   if (selected) {
-    selectedLevelLine = candles.createPriceLine({
-      price: selected.broken_level,
-      color: selected.direction === "bullish" ? "#26a69a" : "#ef5350",
-      lineWidth: 1,
-      axisLabelVisible: true,
-      title: selected.setup_id,
-    });
+    if (selected.broken_level !== null)
+      selectedLevelLine = candles.createPriceLine({
+        price: selected.broken_level,
+        color: selected.direction === "bullish" ? "#26a69a" : "#ef5350",
+        lineWidth: 1,
+        axisLabelVisible: true,
+        title: selected.setup_id,
+      });
     const index = bars.findIndex((bar) => bar.time === selected.signal_time);
     if (index >= 0)
       chart.timeScale().setVisibleLogicalRange({
@@ -235,9 +247,8 @@ function renderEventList() {
       });
   }
   chartContainer.dataset.selectedEventId = selected?.id ?? "";
-  chartContainer.dataset.selectedBrokenLevel = selected
-    ? String(selected.broken_level)
-    : "";
+  chartContainer.dataset.selectedBrokenLevel =
+    selected?.broken_level != null ? String(selected.broken_level) : "";
   renderEventMarkers();
 }
 
@@ -264,7 +275,7 @@ function navigateEvent(step) {
 }
 previousEvent.addEventListener("click", () => navigateEvent(-1));
 nextEvent.addEventListener("click", () => navigateEvent(1));
-for (const input of [swingLeft, swingRight, eventBuffer])
+for (const input of [swingLookback, swingLeft, swingRight, eventBuffer])
   input.addEventListener("change", () => {
     if (!input.reportValidity()) return;
     if (activeSelection)
@@ -884,6 +895,15 @@ async function loadCatalog(previousStates = new Map()) {
         (input) => /** @type {HTMLInputElement} */ (input).value,
       ),
     );
+    const previousDetectorSettings = new Map(
+      Array.from(
+        eventDetectors.querySelectorAll("input[data-detector-setting]"),
+        (input) => {
+          const setting = /** @type {HTMLInputElement} */ (input);
+          return [setting.dataset.detectorSetting, setting.value];
+        },
+      ),
+    );
     const hadDetectorChoices = eventDetectors.querySelector("input") !== null;
     eventDetectors.replaceChildren();
     exportEventDetectors.replaceChildren();
@@ -909,6 +929,29 @@ async function loadCatalog(previousStates = new Map()) {
           });
         label.append(checkbox, ` ${detector.label}`);
         container.append(label);
+        if (container === eventDetectors)
+          for (const setting of detector.settings ?? []) {
+            const settingLabel = document.createElement("label");
+            const settingInput = document.createElement("input");
+            settingInput.type = "number";
+            settingInput.step = "any";
+            settingInput.required = true;
+            settingInput.dataset.detectorSetting = setting.name;
+            settingInput.value = String(
+              previousDetectorSettings.get(setting.name) ?? setting.default,
+            );
+            if (setting.min !== null) settingInput.min = String(setting.min);
+            if (setting.max !== null) settingInput.max = String(setting.max);
+            settingInput.addEventListener("change", () => {
+              if (settingInput.reportValidity() && activeSelection)
+                selectTimeframe(
+                  activeSelection.symbol,
+                  activeSelection.timeframe,
+                );
+            });
+            settingLabel.append(` ${setting.label} `, settingInput);
+            container.append(settingLabel);
+          }
       }
     }
     const hadExportFeatures = exportFeatures.querySelector("input") !== null;
@@ -1076,6 +1119,7 @@ storedFiles.addEventListener("change", async () => {
       datasetVersion.textContent = "Stored data";
       legend.textContent = "Select a symbol and timeframe.";
       symbolSelect.value = "";
+      symbolSelect.disabled = true;
       timeframes.replaceChildren();
       receiveIndicators([], false);
       redraw();
@@ -1153,13 +1197,10 @@ async function downloadEvents(format) {
     const url = new URL("/api/v1/events/export", location.origin);
     url.searchParams.set("symbol", activeSelection.symbol);
     url.searchParams.set("timeframe", activeSelection.timeframe);
-    url.searchParams.set("detectors", detectors.join(","));
     url.searchParams.set("features", features.join(","));
     url.searchParams.set("format", format);
     addPeriods(url);
-    url.searchParams.set("swing_left", swingLeft.value);
-    url.searchParams.set("swing_right", swingRight.value);
-    url.searchParams.set("buffer", eventBuffer.value);
+    addEventSettings(url, detectors);
     const response = await fetch(url);
     if (!response.ok) throw new Error((await response.json()).detail);
     const address = URL.createObjectURL(await response.blob());

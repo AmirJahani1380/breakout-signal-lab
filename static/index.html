@@ -87,8 +87,18 @@
         aria-labelledby="events-tab"
         hidden
       >
-        <p>Breakout detectors</p>
+        <p>Event detectors</p>
         <div id="event-detectors"></div>
+        <label>
+          Swing lookback
+          <input
+            id="swing-lookback"
+            type="number"
+            min="1"
+            max="1000"
+            value="20"
+          />
+        </label>
         <label
           >Swing left bars
           <input id="swing-left" type="number" min="1" max="100" value="3"

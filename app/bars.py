@@ -66,7 +66,7 @@ class BarStore:
     def page(
         self, before: int | None, display_limit: int, warm_up: int = 0, look_ahead: int = 0
     ) -> BarPage:
-        if type(look_ahead) is not int or look_ahead < 0:
+        if isinstance(look_ahead, bool) or not isinstance(look_ahead, int) or look_ahead < 0:
             raise ValueError("look_ahead must be a non-negative integer")
         end = len(self.bars) if before is None else bisect_left(self.times, before)
         display_start = max(0, end - display_limit)
@@ -209,8 +209,6 @@ def _validate_csv_shape(source_path: Path) -> None:
                         f"{source_path.name}, CSV row {row_number}: expected "
                         f"{len(header)} fields, found {len(row)}"
                     )
-    except SourceValidationError:
-        raise
     except (OSError, UnicodeError, csv.Error) as error:
         raise SourceValidationError(f"{source_path.name}: cannot read CSV file: {error}") from error
 

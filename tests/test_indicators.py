@@ -7,6 +7,8 @@ from fastapi.testclient import TestClient
 from app import features as feature_package
 from app.bars import Bar
 from app.features.atr import make_feature as make_atr_feature
+from app.features.confirmed_swing import make_feature as make_swing_feature
+from app.features.donchian_channel import make_feature as make_donchian_feature
 from app.features.ema import calculate as calculate_default_ema
 from app.features.ema import make_feature as make_ema_feature
 from app.features.macd import make_feature as make_macd_feature
@@ -26,6 +28,33 @@ def test_ema_20_is_empty_or_seeded_by_first_close() -> None:
     assert calculate_default_ema(()).frame.empty
     values = calculate_default_ema(price_bars([1.0, 2.0, 3.0])).frame["ema_20"].tolist()
     assert values == pytest.approx((1.0, 1.0952380952, 1.2766439909))
+
+
+def test_donchian_channel_uses_current_rolling_high_low_and_midpoint() -> None:
+    bars = (
+        Bar(1, 5, 10, 2, 5, 1),
+        Bar(2, 6, 12, 4, 6, 1),
+        Bar(3, 7, 9, 3, 7, 1),
+        Bar(4, 8, 8, 5, 8, 1),
+    )
+    feature = make_donchian_feature(3)
+    frame = feature.calculate(bars).frame
+    assert frame.iloc[:2].isna().all().all()
+    assert frame["donchian_upper_3"].iloc[2:].tolist() == [12, 12]
+    assert frame["donchian_lower_3"].iloc[2:].tolist() == [2, 3]
+    assert frame["donchian_middle_3"].iloc[2:].tolist() == [7, 7.5]
+    assert len(feature.views) == 3
+    assert all(view.renderer == "line" for view in feature.views)
+
+
+def test_swing_indicator_period_changes_confirmation_time_and_marker_pivot() -> None:
+    bars = price_bars([8, 9, 12, 9, 8])
+    feature = make_swing_feature(2)
+    frame = feature.calculate(bars).frame
+    assert frame["confirmed_swing_high_2_2"].iloc[4] == 12
+    definition = feature.views[0].definition(feature.calculate(bars))
+    assert definition["points"] == [{"time": 2, "value": 12.0}]
+    assert feature.views[0].selection_key == "confirmed_swing"
 
 
 def test_rsi_14_handles_warmup_flat_and_directional_prices() -> None:
