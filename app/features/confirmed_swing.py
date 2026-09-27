@@ -75,7 +75,7 @@ def make_feature(period: int = 3) -> FeatureDefinition:
                 f"confirmed_swing_{period}_{period}",
                 high.name,
                 f"Confirmed swings {period}/{period}",
-                "Red dots show confirmed swing highs and lows on their pivot candles",
+                "Blue circles mark swing highs; purple squares mark swing lows on pivot candles",
                 "marker",
                 show_in_crosshair=False,
                 series_options={

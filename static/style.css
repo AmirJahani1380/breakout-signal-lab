@@ -11,12 +11,12 @@ main {
   padding: 16px;
 }
 header {
-  display: flex;
-  align-items: baseline;
-  gap: 20px;
+  display: grid;
+  gap: 4px;
 }
 .selectors {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
   margin: 12px 0;
@@ -45,19 +45,29 @@ header {
 .chart-tabs button[aria-selected="true"] {
   background: #2962ff;
 }
+.chart-workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+  margin-top: 12px;
+}
+.chart-workspace:has(.indicators-panel:not([hidden])) {
+  grid-template-columns: minmax(280px, 330px) minmax(0, 1fr);
+}
 .indicators-panel {
-  position: absolute;
-  z-index: 100;
-  width: min(520px, calc(100% - 32px));
+  min-width: 0;
+  max-height: calc(100vh - 230px);
+  overflow-y: auto;
+  box-sizing: border-box;
   padding: 8px;
   background: #1f2430;
   border: 1px solid #363a45;
-  box-shadow: 0 4px 16px #0008;
+}
+.indicators-panel[hidden] {
+  display: none;
 }
 #indicators-panel {
-  box-sizing: border-box;
-  height: 320px;
-  overflow-y: auto;
+  height: auto;
 }
 .indicator {
   display: grid;
@@ -107,15 +117,34 @@ header {
   margin-right: 8px;
 }
 #events-panel {
-  box-sizing: border-box;
-  max-height: 360px;
-  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+#events-panel[hidden] {
+  display: none;
+}
+#events-panel > p {
+  margin: 8px 0;
+}
+.event-settings,
+.detector-settings {
+  margin-top: 8px;
+  font-size: 13px;
+}
+.event-settings summary,
+.detector-settings summary {
+  cursor: pointer;
+}
+.event-settings label {
+  display: block;
+  margin: 5px 0 !important;
 }
 #event-detectors,
 #export-event-detectors {
   display: flex;
   flex-wrap: wrap;
-  gap: 12px;
+  gap: 6px 12px;
 }
 #events-panel label {
   margin-right: 10px;
@@ -123,16 +152,74 @@ header {
 #events-panel input[type="number"] {
   width: 64px;
 }
+.event-filters {
+  display: grid;
+  gap: 8px;
+}
+.event-filters label {
+  display: grid;
+  gap: 3px;
+  margin: 0 !important;
+  font-size: 12px;
+  color: #9598a1;
+}
+.event-filters input {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  padding: 7px;
+  color: #d1d4dc;
+  background: #131722;
+  border: 1px solid #363a45;
+  border-radius: 3px;
+}
 #event-list {
   display: grid;
-  gap: 4px;
+  flex: 1 1 auto;
+  align-content: start;
+  gap: 6px;
   margin-top: 8px;
+  min-height: 0;
+  overflow-y: auto;
 }
 #event-list button {
+  display: grid;
+  gap: 4px;
   text-align: left;
-  background: #1f2430;
+  padding: 8px;
+  background: #161b26;
   color: inherit;
   border: 1px solid #363a45;
+  border-radius: 4px;
+  cursor: pointer;
+}
+#event-list button:hover,
+#event-list button[aria-current="true"] {
+  border-color: #7b9dff;
+  background: #252d40;
+}
+.event-row-top {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  color: #aeb5c5;
+}
+.event-row-name {
+  font-weight: 600;
+}
+.event-row-price {
+  font-variant-numeric: tabular-nums;
+}
+#event-count {
+  margin: 6px 0;
+  color: #aeb5c5;
+  font-size: 12px;
+}
+#event-details {
+  max-height: 70px;
+  overflow-y: auto;
+  font-size: 13px;
 }
 h1 {
   font-size: 18px;
@@ -144,8 +231,17 @@ h1 {
   color: #9598a1;
   font-size: 13px;
 }
+#legend {
+  margin: 0;
+  max-height: 3.3em;
+  line-height: 1.5;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}
 #chart {
-  height: calc(100vh - 155px);
+  min-width: 0;
+  height: calc(100vh - 230px);
   min-height: 420px;
   border: 1px solid #2a2e39;
 }
@@ -158,6 +254,44 @@ h1 {
 .attribution {
   text-align: right;
   margin: 8px 0 0;
+}
+.chart-key {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+  margin: 8px 0 0;
+  color: #aeb5c5;
+  font-size: 12px;
+}
+.bullish-mark {
+  color: #00c853;
+}
+.bearish-mark {
+  color: #ef5350;
+}
+.swing-high-mark {
+  color: #42a5f5;
+}
+.swing-low-mark {
+  color: #ab7df6;
+}
+@media (max-width: 850px) {
+  .chart-workspace:has(.indicators-panel:not([hidden])) {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .indicators-panel {
+    max-height: 360px;
+  }
+  .event-filters {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+  .indicator {
+    grid-template-columns: minmax(100px, 1fr) auto auto;
+  }
+  .indicator [data-indicator-state] {
+    grid-column: 1 / -1;
+    text-align: left;
+  }
 }
 a {
   color: #2962ff;

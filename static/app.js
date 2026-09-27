@@ -31,6 +31,17 @@ const eventDetails = /** @type {HTMLElement} */ (
 const eventList = /** @type {HTMLElement} */ (
   document.querySelector("#event-list")
 );
+const eventSearch = /** @type {HTMLInputElement} */ (
+  document.querySelector("#event-search")
+);
+const eventDate = /** @type {HTMLInputElement} */ (
+  document.querySelector("#event-date")
+);
+const eventCount = /** @type {HTMLElement} */ (
+  document.querySelector("#event-count")
+);
+/** @type {Map<string, string>} */
+const detectorLabels = new Map();
 const exportEventDetectors = /** @type {HTMLElement} */ (
   document.querySelector("#export-event-detectors")
 );
@@ -211,25 +222,56 @@ function renderEventMarkers() {
   chartContainer.dataset.eventMarkerCount = String(markers.length);
 }
 
+function browsedEvents() {
+  const query = eventSearch.value.trim().toLowerCase();
+  return breakoutEvents.filter((event) => {
+    if (!selectedDetectorIds().includes(event.detector)) return false;
+    const timestamp = new Date(event.signal_time * 1000).toISOString();
+    if (eventDate.value && timestamp.slice(0, 10) !== eventDate.value)
+      return false;
+    return `${timestamp} ${detectorLabels.get(event.detector) ?? event.detector} ${event.direction} ${event.breakout_price}`
+      .toLowerCase()
+      .includes(query);
+  });
+}
+
 function renderEventList() {
-  const visible = breakoutEvents.filter((event) =>
-    selectedDetectorIds().includes(event.detector),
-  );
+  const visible = browsedEvents();
   eventList.replaceChildren();
   for (const event of visible) {
     const button = document.createElement("button");
     button.type = "button";
-    button.textContent = `${new Date(event.signal_time * 1000).toISOString()} ${event.detector} ${event.direction} ${event.breakout_price}`;
+    const timestamp = new Date(event.signal_time * 1000).toISOString();
+    const top = document.createElement("span");
+    top.className = "event-row-top";
+    const time = document.createElement("span");
+    time.textContent = `${timestamp.slice(0, 16).replace("T", " ")} UTC`;
+    const direction = document.createElement("span");
+    direction.className = `${event.direction}-mark`;
+    direction.textContent =
+      event.direction === "bullish" ? "↑ Bullish" : "↓ Bearish";
+    top.append(time, direction);
+    const name = document.createElement("span");
+    name.className = "event-row-name";
+    name.textContent = detectorLabels.get(event.detector) ?? event.detector;
+    const price = document.createElement("span");
+    price.className = "event-row-price";
+    price.textContent = `Signal price ${event.breakout_price}`;
+    button.append(top, name, price);
     button.dataset.eventId = event.id;
+    button.dataset.detector = event.detector;
+    button.setAttribute("aria-current", String(event.id === selectedEventId));
     button.addEventListener("click", () => selectEvent(event.id));
     eventList.append(button);
   }
-  const selected = visible.find((event) => event.id === selectedEventId);
+  eventCount.textContent = `${visible.length} of ${breakoutEvents.length} loaded events`;
+  if (!visible.length) eventList.textContent = "No matching events.";
+  const selected = breakoutEvents.find((event) => event.id === selectedEventId);
   if (selectedLevelLine) candles.removePriceLine(selectedLevelLine);
   selectedLevelLine = null;
   eventDetails.textContent = selected
-    ? `${selected.reason}; setup ${selected.setup_id}${selected.broken_level === null ? "" : `; broken level ${selected.broken_level}`}; signal ${new Date(selected.signal_time * 1000).toISOString()}; available ${new Date(selected.availability_time * 1000).toISOString()}`
-    : `${visible.length} loaded events`;
+    ? `${selected.reason}; setup ${selected.setup_id}${selected.broken_level === null ? "" : `; ${selected.detector === "swing_breakout" ? "confirmed pivot breakout level" : "broken level"} ${selected.broken_level}`}; signal ${new Date(selected.signal_time * 1000).toISOString()}; available ${new Date(selected.availability_time * 1000).toISOString()}`
+    : "Select an event to inspect its signal.";
   if (selected) {
     if (selected.broken_level !== null)
       selectedLevelLine = candles.createPriceLine({
@@ -237,7 +279,10 @@ function renderEventList() {
         color: selected.direction === "bullish" ? "#26a69a" : "#ef5350",
         lineWidth: 1,
         axisLabelVisible: true,
-        title: selected.setup_id,
+        title:
+          selected.detector === "swing_breakout"
+            ? "Swing breakout level"
+            : "Breakout level",
       });
     const index = bars.findIndex((bar) => bar.time === selected.signal_time);
     if (index >= 0)
@@ -256,13 +301,14 @@ function renderEventList() {
 function selectEvent(identifier) {
   selectedEventId = identifier;
   renderEventList();
+  eventList
+    .querySelector('[aria-current="true"]')
+    ?.scrollIntoView({ block: "nearest" });
 }
 
 /** @param {number} step */
 function navigateEvent(step) {
-  const visible = breakoutEvents.filter((event) =>
-    selectedDetectorIds().includes(event.detector),
-  );
+  const visible = browsedEvents();
   if (!visible.length) return;
   const position = visible.findIndex((event) => event.id === selectedEventId);
   const next =
@@ -275,6 +321,8 @@ function navigateEvent(step) {
 }
 previousEvent.addEventListener("click", () => navigateEvent(-1));
 nextEvent.addEventListener("click", () => navigateEvent(1));
+eventSearch.addEventListener("input", renderEventList);
+eventDate.addEventListener("input", renderEventList);
 for (const input of [swingLookback, swingLeft, swingRight, eventBuffer])
   input.addEventListener("change", () => {
     if (!input.reportValidity()) return;
@@ -315,11 +363,22 @@ function markerPoints(definition) {
   const options = definition.series_options;
   const position = String(options.position ?? "atPriceMiddle");
   const points = indicatorPoints.get(definition.id) ?? definition.points;
+  const swingBars =
+    definition.selection_key === "confirmed_swing"
+      ? new Map(bars.map((bar) => [bar.time, bar]))
+      : null;
   return points.map((point) => ({
     time: point.time,
-    color: String(options.color ?? "#2962ff"),
+    color: swingBars
+      ? point.value === swingBars.get(point.time)?.high
+        ? "#42a5f5"
+        : "#ab7df6"
+      : String(options.color ?? "#2962ff"),
     position,
-    shape: String(options.shape ?? "circle"),
+    shape:
+      swingBars && point.value !== swingBars.get(point.time)?.high
+        ? "square"
+        : String(options.shape ?? "circle"),
     ...(options.text === undefined ? {} : { text: String(options.text) }),
     ...(options.size === undefined ? {} : { size: Number(options.size) }),
     ...(position.startsWith("atPrice") ? { price: point.value } : {}),
@@ -907,7 +966,9 @@ async function loadCatalog(previousStates = new Map()) {
     const hadDetectorChoices = eventDetectors.querySelector("input") !== null;
     eventDetectors.replaceChildren();
     exportEventDetectors.replaceChildren();
+    detectorLabels.clear();
     for (const detector of featurePayload.event_detectors ?? []) {
+      detectorLabels.set(detector.id, detector.label);
       for (const container of [eventDetectors, exportEventDetectors]) {
         const label = document.createElement("label");
         const checkbox = document.createElement("input");
@@ -1300,6 +1361,11 @@ function onSettingChange(event) {
   });
 }
 
+/** @param {number} value */
+function displayNumber(value) {
+  return Number(value.toPrecision(6)).toString();
+}
+
 chart.subscribeCrosshairMove(
   /** @param {any} event */ (event) => {
     const bar = event.seriesData.get(candles);
@@ -1326,9 +1392,13 @@ chart.subscribeCrosshairMove(
             ? indicatorPoint.value
             : definition.values.find((detail) => detail.time === event.time)
                 ?.value;
-        return value === undefined ? [] : [`${definition.label} ${value}`];
+        return value === undefined
+          ? []
+          : [
+              `${definition.label} ${typeof value === "number" ? displayNumber(value) : value}`,
+            ];
       });
-      legend.textContent = `${time}  O ${point.open} H ${point.high} L ${point.low} C ${point.close}${indicatorValues.length ? `  ${indicatorValues.join("  ")}` : ""}`;
+      legend.textContent = `${time}  O ${displayNumber(point.open)} H ${displayNumber(point.high)} L ${displayNumber(point.low)} C ${displayNumber(point.close)}${indicatorValues.length ? `  ${indicatorValues.join("  ")}` : ""}`;
     }
   },
 );

@@ -17,7 +17,7 @@ def test_event_chart_overlay_matches_api_record(page: Page, viewer_url: str) -> 
     page.get_by_role("button", name="H1").click()
     page.wait_for_function("document.querySelector('#chart').dataset.barCount === '1000'")
     page.get_by_role("tab", name="Events").click()
-    first = page.locator("#event-list button").filter(has_text="ema_breakout").first
+    first = page.locator('#event-list button[data-detector="ema_breakout"]').first
     first.wait_for()
     identifier = first.get_attribute("data-event-id")
     first.click()
@@ -33,22 +33,76 @@ def test_event_chart_overlay_matches_api_record(page: Page, viewer_url: str) -> 
     assert str(record["setup_id"]) in page.locator("#event-details").inner_text()
 
 
+def test_event_panel_keeps_chart_clear_and_filters_events(page: Page, viewer_url: str) -> None:
+    page.set_viewport_size({"width": 1280, "height": 800})
+    page.goto(viewer_url)
+    page.locator("#symbol").select_option("EURUSD")
+    page.get_by_role("button", name="H1").click()
+    page.wait_for_function("document.querySelector('#chart').dataset.barCount === '1000'")
+    page.get_by_role("tab", name="Events").click()
+    panel = page.locator("#events-panel").bounding_box()
+    chart = page.locator("#chart").bounding_box()
+    assert panel is not None and chart is not None
+    assert panel["x"] + panel["width"] < chart["x"]
+
+    first = page.locator('#event-list button[data-detector="ema_breakout"]').first
+    first.click()
+    assert first.get_attribute("aria-current") == "true"
+    assert "EMA close crossing" in first.inner_text()
+    selected_date = first.locator(".event-row-top").inner_text()[:10]
+    assert " UTC" in first.locator(".event-row-top").inner_text()
+
+    page.locator("#event-search").fill("EMA close")
+    assert page.locator('#event-list button[data-detector="swing_breakout"]').count() == 0
+    assert page.locator('#event-list button[data-detector="ema_breakout"]').count() > 0
+    page.locator("#event-date").fill(selected_date)
+    assert page.locator("#event-list button").count() > 0
+    assert all(
+        selected_date in text
+        for text in page.locator("#event-list .event-row-top").all_inner_texts()
+    )
+    page.get_by_role("tab", name="Export").click()
+    export_panel = page.locator("#export-panel").bounding_box()
+    chart = page.locator("#chart").bounding_box()
+    assert export_panel is not None and chart is not None
+    assert export_panel["x"] + export_panel["width"] < chart["x"]
+
+
+def test_crosshair_details_stay_below_title_on_narrow_screen(page: Page, viewer_url: str) -> None:
+    page.set_viewport_size({"width": 480, "height": 800})
+    select_timeframe(page, viewer_url, "M15")
+    page.wait_for_function("document.querySelector('#chart').dataset.barCount === '3'")
+    page.get_by_role("tab", name="Indicators").click()
+    for identifier in ("candle_range", "body_size", "upper_wick_size", "lower_wick_size"):
+        page.locator(f'[data-indicator="{identifier}"] [data-apply]').check()
+    page.evaluate(
+        """() => window.__breakoutChart.setCrosshairPosition(
+            3.5, 1735690500, window.__breakoutChart.panes()[0].getSeries()[0])"""
+    )
+    page.wait_for_function("document.querySelector('#legend').textContent.includes('Range')")
+    title = page.locator("h1").bounding_box()
+    legend = page.locator("#legend").bounding_box()
+    assert title is not None and legend is not None
+    assert title["y"] + title["height"] <= legend["y"]
+    assert legend["height"] <= 46
+
+
 def test_swing_breakouts_and_donchian_channel_in_browser(page: Page, viewer_url: str) -> None:
     page.goto(viewer_url)
     page.locator("#symbol").select_option("BREAKOUT")
     page.get_by_role("button", name="H1").click()
     page.wait_for_function("document.querySelector('#chart').dataset.barCount === '7'")
     page.get_by_role("tab", name="Events").click()
+    page.locator(".event-settings summary").click()
     for selector, value in (("#swing-left", "1"), ("#swing-right", "1"), ("#swing-lookback", "2")):
         control = page.locator(selector)
         control.fill(value)
         control.press("Tab")
     page.wait_for_function(
-        "[...document.querySelectorAll('#event-list button')].filter(button => "
-        "button.textContent.includes('swing_breakout')).length === 2"
+        "document.querySelectorAll('#event-list button[data-detector=swing_breakout]').length === 2"
     )
     page.wait_for_load_state("networkidle")
-    swing_events = page.locator("#event-list button").filter(has_text="swing_breakout")
+    swing_events = page.locator('#event-list button[data-detector="swing_breakout"]')
     assert swing_events.count() == 2
     swing_events.first.click()
     page.wait_for_function("document.querySelector('#chart').dataset.selectedBrokenLevel === '12'")
@@ -85,11 +139,12 @@ def test_level_free_event_has_marker_without_broken_level_line(page: Page, viewe
     page.get_by_role("button", name="H1").click()
     page.wait_for_function("document.querySelector('#chart').dataset.barCount === '7'")
     page.get_by_role("tab", name="Events").click()
-    candle_event = page.locator("#event-list button").filter(has_text="three_bullish_candles").first
+    candle_event = page.locator('#event-list button[data-detector="three_bullish_candles"]').first
     candle_event.click()
     assert page.locator("#chart").get_attribute("data-selected-broken-level") == ""
     assert "broken level" not in page.locator("#event-details").inner_text()
     assert int(page.locator("#chart").get_attribute("data-event-marker-count")) > 0
+    page.locator(".detector-settings summary").click()
     setting = page.locator('input[data-detector-setting="three_bullish_candles.minimum_body"]')
     assert setting.count() == 1
     setting.fill("")
@@ -100,7 +155,7 @@ def test_level_free_event_has_marker_without_broken_level_line(page: Page, viewe
     setting.fill("2")
     setting.dispatch_event("change")
     page.wait_for_function(
-        "!document.querySelector('#event-list').textContent.includes('three_bullish_candles')"
+        "!document.querySelector('#event-list button[data-detector=three_bullish_candles]')"
     )
 
 
@@ -116,6 +171,14 @@ def test_swing_indicator_controls_pivot_dots_on_the_chart(page: Page, viewer_url
     assert swing.count() == 1
     swing.locator("[data-apply]").check()
     page.wait_for_function("document.querySelector('#chart').dataset.markerCount === '2'")
+    markers = page.evaluate(
+        """() => markerPoints(indicatorDefinitions.find(
+            definition => definition.id === 'confirmed_swing_3_3'))"""
+    )
+    assert {(marker["color"], marker["shape"]) for marker in markers} == {
+        ("#42a5f5", "circle"),
+        ("#ab7df6", "square"),
+    }
     swing.get_by_role("button", name="Hide").click()
     page.wait_for_function("document.querySelector('#chart').dataset.markerCount === '0'")
     swing.get_by_role("button", name="Show").click()
@@ -487,7 +550,12 @@ def test_chart_renders_legend_resizes_and_prepends_history(page: Page, viewer_ur
             return candle && volume;
         })"""
     )
-    page.mouse.move(600, 400)
+    chart_bounds = page.locator("#chart").bounding_box()
+    assert chart_bounds is not None
+    page.mouse.move(
+        chart_bounds["x"] + chart_bounds["width"] / 2,
+        chart_bounds["y"] + chart_bounds["height"] / 4,
+    )
     page.wait_for_function("document.querySelector('#legend').textContent.includes(' O ')")
     before_width = page.locator("#chart").bounding_box()["width"]
     before_canvas_width = canvases.first.get_attribute("width")
