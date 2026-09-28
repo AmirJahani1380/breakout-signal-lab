@@ -40,6 +40,18 @@ const eventDate = /** @type {HTMLInputElement} */ (
 const eventCount = /** @type {HTMLElement} */ (
   document.querySelector("#event-count")
 );
+const featureFilters = /** @type {HTMLElement} */ (
+  document.querySelector("#feature-filters")
+);
+const addFeatureFilter = /** @type {HTMLButtonElement} */ (
+  document.querySelector("#add-feature-filter")
+);
+const clearEventFilters = /** @type {HTMLButtonElement} */ (
+  document.querySelector("#clear-event-filters")
+);
+/** @typedef {{name:string,dtype:"Float64"|"Int64"|"boolean",selection_key?:string}} EventFeature */
+/** @type {EventFeature[]} */
+let eventFeatures = [];
 /** @type {Map<string, string>} */
 const detectorLabels = new Map();
 const exportEventDetectors = /** @type {HTMLElement} */ (
@@ -176,9 +188,11 @@ const candles = chart.addSeries(LightweightCharts.CandlestickSeries, {
   wickUpColor: "#26a69a",
   wickDownColor: "#ef5350",
 });
-/** @typedef {{id:string,detector:string,configuration:Record<string, number>,direction:string,setup_id:string,signal_time:number,availability_time:number,broken_level:number|null,breakout_price:number,reason:string,label_status:string,entry_time:number|null,entry_fill:number|null,stop_price:number|null,target_price:number|null,exit_time:number|null,exit_fill:number|null,gross_r:number|null,net_r:number|null,mae_r:number|null,mfe_r:number|null,horizon_complete:boolean}} BreakoutEvent */
+/** @typedef {{id:string,detector:string,configuration:Record<string, number>,direction:string,setup_id:string,signal_time:number,availability_time:number,broken_level:number|null,breakout_price:number,reason:string,label_status:string,entry_time:number|null,entry_fill:number|null,stop_price:number|null,target_price:number|null,exit_time:number|null,exit_fill:number|null,gross_r:number|null,net_r:number|null,mae_r:number|null,mfe_r:number|null,horizon_complete:boolean,feature_values?:Record<string,number|boolean|null>}} BreakoutEvent */
 /** @type {BreakoutEvent[]} */
 let breakoutEvents = [];
+let eventFeatureRefreshVersion = 0;
+let featureFilterError = "";
 /** @type {string | null} */
 let selectedEventId = null;
 /** @type {any} */
@@ -224,12 +238,8 @@ function addEventSettings(url, detectorIds = selectedDetectorIds()) {
 
 function renderEventMarkers() {
   const visibleTimes = new Set(bars.map((bar) => bar.time));
-  const markers = breakoutEvents
-    .filter(
-      (event) =>
-        visibleTimes.has(event.signal_time) &&
-        selectedDetectorIds().includes(event.detector),
-    )
+  const markers = browsedEvents()
+    .filter((event) => visibleTimes.has(event.signal_time))
     .map((event) => ({
       time: event.signal_time,
       position: event.direction === "bullish" ? "atPriceBottom" : "atPriceTop",
@@ -242,6 +252,138 @@ function renderEventMarkers() {
   chartContainer.dataset.eventMarkerCount = String(markers.length);
 }
 
+/** @param {string} [name] @param {string} [operator] @param {string} [filterValue] @param {boolean} [refresh] */
+function addEventFeatureFilter(
+  name,
+  operator = "eq",
+  filterValue = "",
+  refresh = true,
+) {
+  const row = document.createElement("div");
+  row.className = "feature-filter";
+  row.dataset.selectionKey = name ?? "";
+  const feature = document.createElement("select");
+  feature.setAttribute("aria-label", "Event feature");
+  for (const spec of eventFeatures) {
+    const option = document.createElement("option");
+    option.value = spec.name;
+    option.textContent = spec.name;
+    feature.append(option);
+  }
+  if (name && !eventFeatures.some((spec) => spec.name === name)) {
+    const unavailable = document.createElement("option");
+    unavailable.value = name;
+    unavailable.textContent = `${name} (unavailable after settings change)`;
+    feature.append(unavailable);
+  }
+  if (name) feature.value = name;
+  const comparison = document.createElement("select");
+  comparison.setAttribute("aria-label", "Comparison");
+  const value = document.createElement("input");
+  value.setAttribute("aria-label", "Filter value");
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.textContent = "Remove";
+  function updateControls() {
+    const spec = eventFeatures.find((entry) => entry.name === feature.value);
+    row.dataset.invalid = spec ? "" : "true";
+    if (spec) row.dataset.selectionKey = spec.selection_key ?? spec.name;
+    comparison.replaceChildren();
+    for (const [operator, label] of [
+      ["eq", "="],
+      ["ne", "≠"],
+      ...(spec?.dtype === "boolean"
+        ? []
+        : [
+            ["gt", ">"],
+            ["gte", "≥"],
+            ["lt", "<"],
+            ["lte", "≤"],
+          ]),
+      ["missing", "is missing"],
+      ["present", "is present"],
+    ]) {
+      const option = document.createElement("option");
+      option.value = operator;
+      option.textContent = label;
+      comparison.append(option);
+    }
+    if (spec?.dtype === "boolean") {
+      value.type = "text";
+      value.placeholder = "true or false";
+      value.pattern = "true|false";
+    } else {
+      value.type = "number";
+      value.step = spec?.dtype === "Int64" ? "1" : "any";
+      value.placeholder = "Value";
+      value.pattern = "";
+    }
+    value.required = true;
+    value.hidden = false;
+    value.value = "";
+    renderEventList();
+  }
+  feature.addEventListener("change", () => {
+    updateControls();
+    void refreshEventFeatureValues();
+  });
+  comparison.addEventListener("change", () => {
+    value.hidden =
+      comparison.value === "missing" || comparison.value === "present";
+    renderEventList();
+  });
+  value.addEventListener("input", renderEventList);
+  remove.addEventListener("click", () => {
+    row.remove();
+    renderEventList();
+    void refreshEventFeatureValues();
+  });
+  row.append(feature, comparison, value, remove);
+  featureFilters.append(row);
+  updateControls();
+  if (
+    Array.from(comparison.options).some((option) => option.value === operator)
+  )
+    comparison.value = operator;
+  value.value = filterValue;
+  value.hidden =
+    comparison.value === "missing" || comparison.value === "present";
+  renderEventList();
+  if (refresh) void refreshEventFeatureValues();
+}
+
+/** @param {BreakoutEvent} event */
+function matchesFeatureFilters(event) {
+  return Array.from(featureFilters.querySelectorAll(".feature-filter")).every(
+    (row) => {
+      if (/** @type {HTMLElement} */ (row).dataset.invalid === "true")
+        return false;
+      const feature = /** @type {HTMLSelectElement} */ (row.children[0]);
+      const comparison = /** @type {HTMLSelectElement} */ (row.children[1]);
+      const input = /** @type {HTMLInputElement} */ (row.children[2]);
+      if (!event.feature_values || !(feature.value in event.feature_values))
+        return false;
+      const actual = event.feature_values[feature.value];
+      if (comparison.value === "missing") return actual === null;
+      if (comparison.value === "present") return actual !== null;
+      if (actual === null || !input.value || !input.checkValidity())
+        return false;
+      const expected =
+        input.type === "number" ? Number(input.value) : input.value === "true";
+      if (input.type !== "number" && !["true", "false"].includes(input.value))
+        return false;
+      if (comparison.value === "eq") return actual === expected;
+      if (comparison.value === "ne") return actual !== expected;
+      if (typeof actual !== "number" || typeof expected !== "number")
+        return false;
+      if (comparison.value === "gt") return actual > expected;
+      if (comparison.value === "gte") return actual >= expected;
+      if (comparison.value === "lt") return actual < expected;
+      return actual <= expected;
+    },
+  );
+}
+
 function browsedEvents() {
   const query = eventSearch.value.trim().toLowerCase();
   return breakoutEvents.filter((event) => {
@@ -249,6 +391,7 @@ function browsedEvents() {
     const timestamp = new Date(event.signal_time * 1000).toISOString();
     if (eventDate.value && timestamp.slice(0, 10) !== eventDate.value)
       return false;
+    if (!matchesFeatureFilters(event)) return false;
     return `${timestamp} ${detectorLabels.get(event.detector) ?? event.detector} ${event.direction} ${event.breakout_price}`
       .toLowerCase()
       .includes(query);
@@ -284,9 +427,32 @@ function renderEventList() {
     button.addEventListener("click", () => selectEvent(event.id));
     eventList.append(button);
   }
-  eventCount.textContent = `${visible.length} of ${breakoutEvents.length} loaded events`;
+  eventCount.textContent = `${visible.length} / ${breakoutEvents.length} loaded events (${breakoutEvents.length ? ((100 * visible.length) / breakoutEvents.length).toFixed(1) : "0.0"}%) match current filters`;
+  const invalid = Array.from(
+    featureFilters.querySelectorAll('.feature-filter[data-invalid="true"]'),
+  );
+  if (invalid.length)
+    eventCount.textContent +=
+      " — A feature filter is unavailable after settings changed; choose another feature or remove it.";
+  if (
+    Array.from(featureFilters.querySelectorAll(".feature-filter")).some(
+      (row) => {
+        const comparison = /** @type {HTMLSelectElement} */ (row.children[1]);
+        const input = /** @type {HTMLInputElement} */ (row.children[2]);
+        return (
+          !["missing", "present"].includes(comparison.value) &&
+          (!input.value ||
+            !input.checkValidity() ||
+            (input.type === "text" && !["true", "false"].includes(input.value)))
+        );
+      },
+    )
+  )
+    eventCount.textContent +=
+      " — Enter a valid filter value (true or false for boolean features).";
+  if (featureFilterError) eventCount.textContent += ` — ${featureFilterError}`;
   if (!visible.length) eventList.textContent = "No matching events.";
-  const selected = breakoutEvents.find((event) => event.id === selectedEventId);
+  const selected = visible.find((event) => event.id === selectedEventId);
   if (selectedLevelLine) candles.removePriceLine(selectedLevelLine);
   selectedLevelLine = null;
   for (const line of selectedLabelLines) candles.removePriceLine(line);
@@ -365,6 +531,15 @@ previousEvent.addEventListener("click", () => navigateEvent(-1));
 nextEvent.addEventListener("click", () => navigateEvent(1));
 eventSearch.addEventListener("input", renderEventList);
 eventDate.addEventListener("input", renderEventList);
+addFeatureFilter.addEventListener("click", () => addEventFeatureFilter());
+clearEventFilters.addEventListener("click", () => {
+  eventFeatureRefreshVersion++;
+  featureFilterError = "";
+  eventSearch.value = "";
+  eventDate.value = "";
+  featureFilters.replaceChildren();
+  renderEventList();
+});
 for (const input of [swingLookback, swingLeft, swingRight, eventBuffer])
   input.addEventListener("change", () => {
     if (!input.reportValidity()) return;
@@ -719,6 +894,69 @@ function addPeriods(url) {
   for (const [key, value] of selectedPeriods) url.searchParams.set(key, value);
 }
 
+async function refreshEventFeatureValues() {
+  const refreshVersion = ++eventFeatureRefreshVersion;
+  featureFilterError = "";
+  const names = [
+    ...new Set(
+      Array.from(
+        featureFilters.querySelectorAll(
+          '.feature-filter:not([data-invalid="true"]) select:first-child',
+        ),
+        (select) => /** @type {HTMLSelectElement} */ (select).value,
+      ),
+    ),
+  ];
+  for (const event of breakoutEvents) event.feature_values = {};
+  renderEventList();
+  if (
+    !names.length ||
+    !activeSelection ||
+    !loadedBefores.length ||
+    dataMode.value !== "source"
+  )
+    return;
+  const version = selectionVersion;
+  try {
+    /** @type {Map<string, Record<string,number|boolean|null>>} */
+    const valuesById = new Map();
+    for (const before of loadedBefores) {
+      const url = new URL("/api/v1/events", window.location.origin);
+      url.searchParams.set("symbol", activeSelection.symbol);
+      url.searchParams.set("timeframe", activeSelection.timeframe);
+      if (before !== null) url.searchParams.set("before", String(before));
+      addPeriods(url);
+      addEventSettings(url);
+      url.searchParams.set("features", names.join(","));
+      const response = await fetch(url);
+      if (!response.ok)
+        throw new Error(
+          (await response.json()).detail || `Server error ${response.status}`,
+        );
+      const payload = await response.json();
+      if (
+        version !== selectionVersion ||
+        refreshVersion !== eventFeatureRefreshVersion
+      )
+        return;
+      for (const event of /** @type {BreakoutEvent[]} */ (payload.events))
+        if (event.feature_values)
+          valuesById.set(event.id, event.feature_values);
+    }
+    for (const event of breakoutEvents)
+      event.feature_values = valuesById.get(event.id) ?? {};
+    renderEventList();
+  } catch (error) {
+    if (
+      version !== selectionVersion ||
+      refreshVersion !== eventFeatureRefreshVersion
+    )
+      return;
+    featureFilterError = `Unable to load event features: ${error instanceof Error ? error.message : String(error)}`;
+    renderEventList();
+  }
+}
+
 /** @param {number} version */
 async function refreshIndicators(version) {
   if (dataMode.value === "stored") return;
@@ -886,6 +1124,7 @@ async function load(before, version) {
     }
     receiveIndicators(payload.indicators ?? [], before !== null);
     if (!loadedBefores.includes(before)) loadedBefores.push(before);
+    if (dataMode.value === "source") void refreshEventFeatureValues();
     nextBefore = payload.next_before;
     hasMore = payload.has_more;
     redraw();
@@ -993,6 +1232,28 @@ async function loadCatalog(previousStates = new Map()) {
         indicatorStates.set(definition.id, { ...previousState });
     }
     receiveIndicators(featurePayload.indicators ?? [], false);
+    const previousFilters = Array.from(
+      featureFilters.querySelectorAll(".feature-filter"),
+      (row) => ({
+        selectionKey: /** @type {HTMLElement} */ (row).dataset.selectionKey,
+        name: /** @type {HTMLSelectElement} */ (row.children[0]).value,
+        operator: /** @type {HTMLSelectElement} */ (row.children[1]).value,
+        value: /** @type {HTMLInputElement} */ (row.children[2]).value,
+      }),
+    );
+    eventFeatures = featurePayload.export_features ?? [];
+    featureFilters.replaceChildren();
+    for (const filter of previousFilters) {
+      const replacement = eventFeatures.find(
+        (spec) => (spec.selection_key ?? spec.name) === filter.selectionKey,
+      );
+      addEventFeatureFilter(
+        replacement?.name ?? filter.name,
+        filter.operator,
+        filter.value,
+        false,
+      );
+    }
     const previouslyChecked = new Set(
       Array.from(
         eventDetectors.querySelectorAll("input:checked"),

@@ -216,7 +216,13 @@ def test_supplied_builtin_same_spec_cannot_replace_its_calculator() -> None:
             {spec.name: [bar.close + 100 for bar in source]},
         )
 
-    definition = FeatureDefinition((spec,), different_calculate, ())
+    definition = FeatureDefinition(
+        (spec,),
+        different_calculate,
+        (),
+        settings=ema_definition.settings,
+        configure=ema_definition.configure,
+    )
     with pytest.raises(FeatureExportError, match="does not match the bundled"):
         build_feature_frame(bars(3), "EURUSD", "H1", ["ema_20"], (definition,))
 

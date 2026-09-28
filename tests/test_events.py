@@ -13,6 +13,7 @@ from fastapi.testclient import TestClient
 import app.event_detectors as event_detectors
 from app.bars import Bar
 from app.event_detectors import EventConfig, EventDetector, detect_events, make_event
+from app.features import FeatureDefinition, FeatureSetting, FeatureSpec, FeatureTable, discover
 from app.features.confirmed_swing import confirmed_swings
 from app.main import Settings, create_app
 
@@ -420,6 +421,32 @@ def test_api_paging_and_event_export_match(tmp_path: Path) -> None:
         assert [event["id"] for event in second["events"] + first["events"]] == [
             event["id"] for event in all_events["events"]
         ]
+        featured = client.get(
+            "/api/v1/events",
+            params={
+                "symbol": "EURUSD",
+                "timeframe": "H1",
+                "swing_left": 2,
+                "swing_right": 2,
+                "features": "candle_direction,ema_slope_20_20_atr_20",
+            },
+        )
+        assert featured.status_code == 200
+        assert [event["id"] for event in featured.json()["events"]] == [
+            event["id"] for event in all_events["events"]
+        ]
+        assert all(
+            event["feature_values"]["candle_direction"] in (-1, 0, 1)
+            and event["feature_values"]["ema_slope_20_20_atr_20"] is None
+            for event in featured.json()["events"]
+        )
+        for invalid in ("unknown_feature", "candle_direction,candle_direction"):
+            response = client.get(
+                "/api/v1/events",
+                params={"symbol": "EURUSD", "timeframe": "H1", "features": invalid},
+            )
+            assert response.status_code == 422
+            assert "feature" in response.json()["detail"]
         exported = client.get(
             "/api/v1/events/export",
             params={
@@ -439,6 +466,65 @@ def test_api_paging_and_event_export_match(tmp_path: Path) -> None:
             [event["broken_level"] for event in all_events["events"]]
         )
         assert "ema_20" in frame
+
+
+def test_event_features_use_configured_app_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def custom_feature(period: int = 2) -> FeatureDefinition:
+        name = f"custom_score_{period}"
+        spec = FeatureSpec(name, "Float64", {"window": period}, selection_key="custom_score")
+
+        def calculate(source: Sequence[Bar]) -> FeatureTable:
+            return FeatureTable.from_columns(
+                (spec,),
+                [bar.time for bar in source],
+                {name: [period * bar.close for bar in source]},
+            )
+
+        return FeatureDefinition(
+            (spec,),
+            calculate,
+            (),
+            settings=(
+                FeatureSetting("custom_period", "Custom period", 2, 1, 10, parameters=("window",)),
+            ),
+            configure=lambda values: custom_feature(values["custom_period"]),
+        )
+
+    monkeypatch.setattr("app.main.discover", lambda: discover() + (custom_feature(),))
+    root = tmp_path / "market"
+    root.mkdir()
+    bars = bars_from_closes([8, 9, 12, 9, 8, 14, 14])
+    (root / "EURUSD_H1.csv").write_text(
+        "time,open,high,low,close,volume\n"
+        + "".join(
+            f"{bar.time},{bar.open},{bar.high},{bar.low},{bar.close},{bar.volume}\n" for bar in bars
+        ),
+        encoding="utf-8",
+    )
+    with TestClient(create_app(Settings(root))) as client:
+        offered = client.get("/api/v1/features", params={"custom_period": 3}).json()
+        response = client.get(
+            "/api/v1/events",
+            params={
+                "symbol": "EURUSD",
+                "timeframe": "H1",
+                "swing_left": 2,
+                "swing_right": 2,
+                "custom_period": 3,
+                "features": "custom_score_3",
+            },
+        )
+    assert "custom_score_3" in {spec["name"] for spec in offered["export_features"]}
+    assert response.status_code == 200
+    events = response.json()["events"]
+    assert events
+    closes = {bar.time: bar.close for bar in bars}
+    assert all(
+        event["feature_values"]["custom_score_3"] == 3 * closes[event["signal_time"]]
+        for event in events
+    )
 
 
 def test_empty_event_export_has_headers(tmp_path: Path) -> None:

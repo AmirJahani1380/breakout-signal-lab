@@ -8,7 +8,7 @@ import zipfile
 from io import BytesIO
 from math import isfinite
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -129,6 +129,7 @@ def register_event_routes(app: FastAPI, source_timezone: str, page_size: int) ->
         timeframe: str = Query(min_length=1, max_length=100),
         before: int | None = None,
         limit: int = Query(default=page_size, ge=1, le=page_size),
+        features: str = "",
     ) -> dict[str, object]:
         source_catalog: SourceCatalog | None = app.state.catalog
         if source_catalog is None:
@@ -148,8 +149,24 @@ def register_event_routes(app: FastAPI, source_timezone: str, page_size: int) ->
             page = store.page(before, limit)
             times = {bar.time for bar in page.display_bars}
             labeled = label_events(store.bars, detected, label_configuration(request))
+            visible_events = [event for event in labeled if event["signal_time"] in times]
+            if features:
+                names = features.split(",")
+                definitions = configure_features(app.state.features, request.query_params)
+                frame, _ = build_feature_frame(store.bars, symbol, timeframe, names, definitions)
+                signal_features = frame.set_index("time")[names]
+                for event in visible_events:
+                    signal_time = cast(int, event["signal_time"])
+                    event["feature_values"] = {
+                        name: None
+                        if pd.isna(value := signal_features.at[signal_time, name])
+                        else value.item()
+                        if hasattr(value, "item")
+                        else value
+                        for name in names
+                    }
             return {
-                "events": [event for event in labeled if event["signal_time"] in times],
+                "events": visible_events,
                 "swings": [
                     {
                         "direction": swing.direction,
@@ -165,7 +182,7 @@ def register_event_routes(app: FastAPI, source_timezone: str, page_size: int) ->
                 else None,
                 "has_more": page.has_more,
             }
-        except (OSError, SourceValidationError, ValueError) as error:
+        except (OSError, SourceValidationError, FeatureExportError, ValueError) as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
 
     @app.get("/api/v1/events/export")

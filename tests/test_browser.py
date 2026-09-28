@@ -318,6 +318,207 @@ def test_swing_breakouts_and_donchian_channel_in_browser(page: Page, viewer_url:
     assert sorted(series) == [6, 9.5, 13]
 
 
+def test_feature_filters_control_swing_markers_and_matching_share(
+    page: Page, viewer_url: str
+) -> None:
+    page.goto(viewer_url)
+    page.locator("#symbol").select_option("BREAKOUT")
+    page.get_by_role("button", name="H1").click()
+    page.wait_for_function("document.querySelector('#chart').dataset.barCount === '7'")
+    page.get_by_role("tab", name="Events").click()
+    page.locator(".event-settings summary").click()
+    for selector, value in (("#swing-left", "1"), ("#swing-right", "1"), ("#swing-lookback", "2")):
+        control = page.locator(selector)
+        control.fill(value)
+        control.press("Tab")
+    page.wait_for_function(
+        "document.querySelectorAll('#event-list button[data-detector=swing_breakout]').length === 2"
+    )
+    total = page.locator("#event-list button").count()
+    original_markers = int(page.locator("#chart").get_attribute("data-event-marker-count") or "0")
+
+    page.locator("#add-feature-filter").click()
+    first_filter = page.locator(".feature-filter").first
+    first_filter.get_by_label("Event feature").select_option("candle_direction")
+    first_filter.get_by_label("Filter value").fill("1")
+    page.wait_for_function(
+        "document.querySelectorAll('#event-list button[data-detector=swing_breakout]').length === 1"
+    )
+    assert page.locator('#event-list button[data-detector="swing_breakout"]').count() == 1
+    matching = page.locator("#event-list button").count()
+    assert 0 < matching < total
+    assert page.locator("#event-count").inner_text() == (
+        f"{matching} / {total} loaded events ({100 * matching / total:.1f}%) match current filters"
+    )
+    assert int(page.locator("#chart").get_attribute("data-event-marker-count") or "0") == matching
+    assert matching < original_markers
+
+    page.locator("#add-feature-filter").click()
+    second_filter = page.locator(".feature-filter").nth(1)
+    second_filter.get_by_label("Event feature").select_option("atr_20")
+    second_filter.get_by_label("Comparison").select_option("gt")
+    second_filter.get_by_label("Filter value").fill("1.5")
+    page.wait_for_function(
+        "document.querySelector('#event-count').textContent.startsWith('0 / 4') && "
+        "document.querySelector('#chart').dataset.eventMarkerCount === '0'"
+    )
+    assert page.locator("#event-list button").count() == 0
+    assert page.locator("#chart").get_attribute("data-event-marker-count") == "0"
+    assert page.locator("#event-count").inner_text().startswith(f"0 / {total} loaded events")
+
+    second_filter.get_by_role("button", name="Remove").click()
+    page.wait_for_function(
+        "document.querySelector('#event-count').textContent.startsWith('2 / 4') && "
+        "document.querySelector('#chart').dataset.eventMarkerCount === '2'"
+    )
+    assert page.locator("#event-list button").count() == matching
+
+    page.locator("#clear-event-filters").click()
+    assert page.locator("#event-list button").count() == total
+    assert page.locator("#chart").get_attribute("data-event-marker-count") == str(original_markers)
+
+
+def test_three_non_null_feature_conditions_and_period_reload(page: Page, viewer_url: str) -> None:
+    page.goto(viewer_url)
+    page.get_by_role("tab", name="Indicators").click()
+    for setting, value in (("atr_period", "2"), ("ema_period", "2"), ("ema_slope_bars", "1")):
+        control = page.locator(f'[data-period="{setting}"]').first
+        control.fill(value)
+        control.press("Tab")
+        page.wait_for_load_state("networkidle")
+    page.wait_for_function("eventFeatures.some(feature => feature.name === 'ema_slope_2_1_atr_2')")
+    page.locator("#symbol").select_option("BREAKOUT")
+    page.get_by_role("button", name="H1").click()
+    page.wait_for_function("document.querySelector('#chart').dataset.barCount === '7'")
+    page.get_by_role("tab", name="Events").click()
+    page.locator(".event-settings summary").click()
+    for selector, value in (("#swing-left", "1"), ("#swing-right", "1"), ("#swing-lookback", "2")):
+        control = page.locator(selector)
+        control.fill(value)
+        control.press("Tab")
+    page.wait_for_function(
+        "document.querySelectorAll('#event-list button[data-detector=swing_breakout]').length === 2"
+    )
+    for name, operator, value in (
+        ("candle_direction", "eq", "1"),
+        ("ema_slope_2_1_atr_2", "gt", "0.12"),
+        ("atr_2", "gt", "1.5"),
+    ):
+        page.locator("#add-feature-filter").click()
+        row = page.locator(".feature-filter").last
+        row.get_by_label("Event feature").select_option(name)
+        row.get_by_label("Comparison").select_option(operator)
+        row.get_by_label("Filter value").fill(value)
+    page.wait_for_function(
+        "breakoutEvents.every(event => event.feature_values && "
+        "'candle_direction' in event.feature_values && "
+        "'ema_slope_2_1_atr_2' in event.feature_values && 'atr_2' in event.feature_values)"
+    )
+    values = page.evaluate("breakoutEvents.map(event => event.feature_values)")
+    assert all(
+        value["ema_slope_2_1_atr_2"] is not None and value["atr_2"] is not None for value in values
+    )
+    assert page.locator("#event-count").inner_text().startswith("2 / 5 loaded events (40.0%)")
+    assert page.locator("#chart").get_attribute("data-event-marker-count") == "2"
+    assert page.locator('#event-list button[data-detector="swing_breakout"]').count() == 1
+
+    page.get_by_role("tab", name="Indicators").click()
+    period = page.locator('[data-period="atr_period"]').first
+    period.fill("3")
+    period.press("Tab")
+    page.wait_for_function("eventFeatures.some(feature => feature.name === 'atr_3')")
+    page.get_by_role("tab", name="Events").click()
+    rows = page.locator(".feature-filter")
+    assert rows.count() == 3
+    assert rows.nth(1).get_by_label("Event feature").input_value() == "ema_slope_2_1_atr_3"
+    assert rows.nth(2).get_by_label("Event feature").input_value() == "atr_3"
+    assert [row.get_by_label("Filter value").input_value() for row in rows.all()] == [
+        "1",
+        "0.12",
+        "1.5",
+    ]
+    page.wait_for_function(
+        "breakoutEvents.length === 5 && "
+        "breakoutEvents.every(event => event.feature_values && 'atr_3' in event.feature_values)"
+    )
+    assert page.locator("#event-count").inner_text().startswith("2 / 5 loaded events (40.0%)")
+
+    def omit_selected_feature(route: object) -> None:
+        payload = route.fetch().json()  # type: ignore[attr-defined]
+        payload["export_features"] = [
+            spec for spec in payload["export_features"] if spec.get("selection_key") != "atr"
+        ]
+        route.fulfill(json=payload)  # type: ignore[attr-defined]
+
+    page.route("**/api/v1/features?*atr_period=4*", omit_selected_feature)
+    page.get_by_role("tab", name="Indicators").click()
+    period = page.locator('[data-period="atr_period"]').first
+    period.fill("4")
+    period.press("Tab")
+    page.wait_for_function(
+        "selectedPeriods.get('atr_period') === '4' && "
+        "eventFeatures.every(feature => feature.name !== 'atr_4')"
+    )
+    page.get_by_role("tab", name="Events").click()
+    assert page.locator('.feature-filter[data-invalid="true"]').count() == 1
+    assert "unavailable after settings changed" in page.locator("#event-count").inner_text()
+    assert page.locator("#chart").get_attribute("data-event-marker-count") == "0"
+
+    page.locator("#clear-event-filters").click()
+    assert page.locator("#event-list button").count() == 5
+    assert page.locator("#chart").get_attribute("data-event-marker-count") == "5"
+    page.locator("#add-feature-filter").click()
+    boolean_filter = page.locator(".feature-filter").last
+    boolean_filter.get_by_label("Event feature").select_option("is_engulfing")
+    assert boolean_filter.get_by_label("Comparison").locator("option").count() == 4
+    boolean_filter.get_by_label("Filter value").fill("false")
+    page.wait_for_function(
+        "breakoutEvents.every(event => event.feature_values && "
+        "'is_engulfing' in event.feature_values)"
+    )
+    expected_boolean = page.evaluate(
+        "breakoutEvents.filter(event => event.feature_values.is_engulfing === false).length"
+    )
+    assert page.locator("#event-list button").count() == expected_boolean
+    boolean_filter.get_by_label("Filter value").fill("invalid")
+    assert page.locator("#event-list button").count() == 0
+    assert "Enter a valid filter value" in page.locator("#event-count").inner_text()
+    boolean_filter.get_by_label("Filter value").fill("false")
+
+    page.locator("#add-feature-filter").click()
+    missing_filter = page.locator(".feature-filter").last
+    missing_filter.get_by_label("Event feature").select_option("rolling_overlap_20")
+    missing_filter.get_by_label("Comparison").select_option("missing")
+    page.wait_for_function(
+        "breakoutEvents.every(event => event.feature_values && "
+        "'rolling_overlap_20' in event.feature_values)"
+    )
+    assert page.locator("#event-list button").count() == expected_boolean
+
+
+def test_failed_filter_calculation_does_not_replace_base_events(
+    page: Page, viewer_url: str
+) -> None:
+    page.goto(viewer_url)
+    page.locator("#symbol").select_option("BREAKOUT")
+    page.get_by_role("button", name="H1").click()
+    page.wait_for_function("document.querySelector('#chart').dataset.barCount === '7'")
+    page.get_by_role("tab", name="Events").click()
+    total = page.locator("#event-list button").count()
+    assert total > 0
+    page.route(
+        "**/api/v1/events?*features=*",
+        lambda route: route.fulfill(status=422, json={"detail": "feature calculation failed"}),
+    )
+    page.locator("#add-feature-filter").click()
+    page.wait_for_function(
+        "document.querySelector('#event-count').textContent.includes('feature calculation failed')"
+    )
+    assert page.locator("#event-list button").count() == 0
+    page.locator("#clear-event-filters").click()
+    assert page.locator("#event-list button").count() == total
+
+
 def test_swing_indicator_controls_pivot_dots_on_the_chart(page: Page, viewer_url: str) -> None:
     page.goto(viewer_url)
     page.locator("#symbol").select_option("PIVOT")
@@ -395,6 +596,7 @@ def test_stored_paging_visibility_and_selection_preserve_values(
     page: Page, viewer_url: str
 ) -> None:
     page.goto(viewer_url)
+    page.locator("#export-features input").first.wait_for(state="attached")
     original_export_count = page.locator("#export-features input").count()
     page.locator("#data-mode").select_option("stored")
     assert page.locator("#export-tab").is_disabled()
