@@ -10,6 +10,32 @@ import pandas as pd
 import pytest
 from playwright.sync_api import Page
 
+from tests.test_bars import valid, write_csv
+
+
+def test_folder_selection_loads_its_chart(page: Page, viewer_url: str, tmp_path: Path) -> None:
+    folder = tmp_path / "chosen-market"
+    folder.mkdir()
+    write_csv(folder / "LOCAL_H1.csv", [valid(100), valid(101), valid(102)])
+    page.goto(viewer_url)
+    page.locator("#symbol").select_option("BREAKOUT")
+    page.get_by_role("button", name="H1").click()
+    page.get_by_role("tab", name="Events").click()
+    page.locator("#event-list button").first.click()
+    assert page.locator("#chart").get_attribute("data-selected-event-id")
+    page.locator("#source-folder").set_input_files(str(folder))
+    page.get_by_text("Loaded 1 source file. Choose a symbol and timeframe.").wait_for()
+    assert page.locator("#chart").get_attribute("data-selected-event-id") == ""
+    assert page.locator("#event-details").inner_text() == "Select an event to inspect its signal."
+    assert page.locator("#event-count").inner_text().startswith("0 / 0 loaded events")
+    assert (
+        page.evaluate("window.__breakoutChart.panes()[0].getSeries()[0].priceLines().length") == 0
+    )
+    page.locator("#symbol").select_option("LOCAL")
+    page.get_by_role("button", name="H1").click()
+    page.wait_for_function("document.querySelector('#chart').dataset.barCount === '3'")
+    assert page.locator("#legend").inner_text() == "LOCAL H1"
+
 
 def test_event_chart_overlay_matches_api_record(page: Page, viewer_url: str) -> None:
     page.goto(viewer_url)
@@ -88,6 +114,17 @@ def test_fixed_2r_chart_details_agree_with_downloaded_csv(
     assert float(
         page.locator("#chart").get_attribute("data-selected-target-price")
     ) == pytest.approx(selected["target_price"])
+    price_lines = page.evaluate(
+        "window.__breakoutChart.panes()[0].getSeries()[0].priceLines().map(line => line.options())"
+    )
+    assert {line["title"]: line["price"] for line in price_lines} == {
+        "2R stop": selected["stop_price"],
+        "Entry fill": selected["entry_fill"],
+        "2R target": selected["target_price"],
+        (
+            "Swing breakout level" if selected["detector"] == "swing_breakout" else "Breakout level"
+        ): selected["broken_level"],
+    }
 
     with page.expect_download() as transfer:
         page.get_by_role("button", name="Download labels CSV").click()

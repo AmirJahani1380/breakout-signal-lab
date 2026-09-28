@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import tempfile
 import zipfile
+from collections.abc import Callable
 from io import BytesIO
 from math import isfinite
 from pathlib import Path
@@ -55,7 +56,12 @@ EVENT_COLUMNS = (
 )
 
 
-def register_event_routes(app: FastAPI, source_timezone: str, page_size: int) -> None:
+def register_event_routes(
+    app: FastAPI,
+    source_timezone: str,
+    page_size: int,
+    source_catalog: Callable[[Request], SourceCatalog],
+) -> None:
     def label_configuration(request: Request) -> LabelConfig:
         def integer(name: str, default: int) -> int:
             raw = request.query_params.get(name, str(default))
@@ -131,11 +137,8 @@ def register_event_routes(app: FastAPI, source_timezone: str, page_size: int) ->
         limit: int = Query(default=page_size, ge=1, le=page_size),
         features: str = "",
     ) -> dict[str, object]:
-        source_catalog: SourceCatalog | None = app.state.catalog
-        if source_catalog is None:
-            raise HTTPException(status_code=503, detail=app.state.source_error)
         try:
-            selection = source_catalog.selection(symbol, timeframe)
+            selection = source_catalog(request).selection(symbol, timeframe)
             store = load_bars(selection.source_path, source_timezone)
             detector_names = selected_detectors(request)
             config = event_configuration(request, detector_names)
@@ -193,11 +196,8 @@ def register_event_routes(app: FastAPI, source_timezone: str, page_size: int) ->
         features: str = "",
         output_format: Literal["csv", "parquet"] = Query(default="csv", alias="format"),
     ) -> Response:
-        source_catalog: SourceCatalog | None = app.state.catalog
-        if source_catalog is None:
-            raise HTTPException(status_code=503, detail=app.state.source_error)
         try:
-            selection = source_catalog.selection(symbol, timeframe)
+            selection = source_catalog(request).selection(symbol, timeframe)
             store = load_bars(selection.source_path, source_timezone)
             definitions = configure_features(app.state.features, request.query_params)
             names = [name for name in features.split(",") if name]

@@ -24,6 +24,13 @@
         </select>
         <div id="timeframes" aria-label="Available timeframes"></div>
       </section>
+      <section id="source-import" aria-label="Choose source folder">
+        <label for="source-folder"
+          >Choose a folder of CSV, Parquet, or XLSX charts</label
+        >
+        <input id="source-folder" type="file" webkitdirectory multiple />
+        <p id="source-import-status" role="status"></p>
+      </section>
       <section id="stored-import" aria-label="Import stored exports" hidden>
         <label for="stored-files"
           >Choose CSV or Parquet exports and matching JSON metadata</label

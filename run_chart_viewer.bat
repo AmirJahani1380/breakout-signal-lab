@@ -2,12 +2,12 @@
 setlocal
 
 cd /d "%~dp0"
-set "PYTHON=C:\ProgramData\anaconda3\python.exe"
-set "BARS_DATA_ROOT=C:\Users\amirj\OneDrive\Desktop\programming\Trade\data analysis\mt5_data"
+set "PYTHON=%~dp0.venv\Scripts\python.exe"
+if not exist "%PYTHON%" set "PYTHON=python"
 
-if not exist "%PYTHON%" (
-  echo Python was not found at %PYTHON%
-  echo Edit this file and set PYTHON to your Python executable.
+"%PYTHON%" --version >nul 2>&1
+if errorlevel 1 (
+  echo Python was not found. Install Python or create the project virtual environment.
   pause
   exit /b 1
 )

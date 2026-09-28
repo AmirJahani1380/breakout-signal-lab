@@ -100,6 +100,11 @@ const storedImportStatusElement = document.querySelector(
 const storedImportResultsElement = document.querySelector(
   "#stored-import-results",
 );
+const sourceImportElement = document.querySelector("#source-import");
+const sourceFolderElement = document.querySelector("#source-folder");
+const sourceImportStatusElement = document.querySelector(
+  "#source-import-status",
+);
 if (
   !(chartElement instanceof HTMLElement) ||
   !stateElement ||
@@ -122,7 +127,10 @@ if (
   !(storedImportElement instanceof HTMLElement) ||
   !(storedFilesElement instanceof HTMLInputElement) ||
   !(storedImportStatusElement instanceof HTMLElement) ||
-  !(storedImportResultsElement instanceof HTMLElement)
+  !(storedImportResultsElement instanceof HTMLElement) ||
+  !(sourceImportElement instanceof HTMLElement) ||
+  !(sourceFolderElement instanceof HTMLInputElement) ||
+  !(sourceImportStatusElement instanceof HTMLElement)
 )
   throw new Error("Missing chart UI");
 const chartContainer = chartElement;
@@ -151,6 +159,17 @@ const storedImport = storedImportElement;
 const storedFiles = storedFilesElement;
 const storedImportStatus = storedImportStatusElement;
 const storedImportResults = storedImportResultsElement;
+const sourceImport = sourceImportElement;
+const sourceFolder = sourceFolderElement;
+const sourceImportStatus = sourceImportStatusElement;
+/** @type {string | null} */
+let sourceSession = null;
+
+/** @param {URL} url */
+function addSourceSession(url) {
+  if (sourceSession && dataMode.value === "source")
+    url.searchParams.set("source_session", sourceSession);
+}
 const importSession =
   sessionStorage.getItem("storedImportSession") ?? crypto.randomUUID();
 sessionStorage.setItem("storedImportSession", importSession);
@@ -210,6 +229,7 @@ function selectedDetectorIds() {
 
 /** @param {URL} url @param {string[]} detectorIds */
 function addEventSettings(url, detectorIds = selectedDetectorIds()) {
+  addSourceSession(url);
   url.searchParams.set("detectors", detectorIds.join(","));
   url.searchParams.set("swing_lookback", swingLookback.value);
   url.searchParams.set("swing_left", swingLeft.value);
@@ -463,6 +483,7 @@ function renderEventList() {
   if (selected) {
     for (const [title, price, color] of [
       ["2R stop", selected.stop_price, "#ef5350"],
+      ["Entry fill", selected.entry_fill, "#2962ff"],
       ["2R target", selected.target_price, "#00c853"],
     ]) {
       if (price !== null)
@@ -967,6 +988,7 @@ async function refreshIndicators(version) {
     let prepend = false;
     for (const before of loadedBefores) {
       const url = new URL("/api/v1/bars", window.location.origin);
+      addSourceSession(url);
       url.searchParams.set("symbol", activeSelection.symbol);
       url.searchParams.set("timeframe", activeSelection.timeframe);
       addPeriods(url);
@@ -1055,6 +1077,7 @@ async function load(before, version) {
   if (before === null) setInitialState("Loading chart…");
   try {
     const url = new URL("/api/v1/bars", window.location.origin);
+    addSourceSession(url);
     url.searchParams.set("mode", dataMode.value);
     if (dataMode.value === "stored")
       url.searchParams.set("import_session", importSession);
@@ -1350,6 +1373,7 @@ async function loadCatalog(previousStates = new Map()) {
       exportFeatures.append(label);
     }
     const catalogUrl = new URL("/api/v1/catalog", window.location.origin);
+    addSourceSession(catalogUrl);
     catalogUrl.searchParams.set("mode", requestedMode);
     if (requestedMode === "stored")
       catalogUrl.searchParams.set("import_session", importSession);
@@ -1401,6 +1425,7 @@ dataMode.addEventListener("change", () => {
     dataMode.value === "stored" ? "Stored data" : "Calculated data";
   valueInspector.hidden = dataMode.value !== "stored";
   storedImport.hidden = dataMode.value !== "stored";
+  sourceImport.hidden = dataMode.value !== "source";
   exportTab.disabled = dataMode.value === "stored";
   eventsTab.disabled = dataMode.value === "stored";
   eventsPanel.hidden = true;
@@ -1424,6 +1449,61 @@ function fileBase64(file) {
 }
 
 let importingStoredFiles = false;
+sourceFolder.addEventListener("change", async () => {
+  const files = Array.from(sourceFolder.files ?? []).filter((file) =>
+    /\.(csv|parquet|xlsx)$/i.test(file.name),
+  );
+  if (!files.length) {
+    sourceImportStatus.textContent =
+      "The selected folder has no CSV, Parquet, or XLSX source files.";
+    return;
+  }
+  sourceFolder.disabled = true;
+  const session = crypto.randomUUID();
+  try {
+    for (const [index, file] of files.entries()) {
+      sourceImportStatus.textContent = `Loading source ${index + 1} of ${files.length}: ${file.name}`;
+      const response = await fetch("/api/v1/source/import", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: session,
+          filename: file.name,
+          content_base64: await fileBase64(file),
+        }),
+      });
+      if (!response.ok)
+        throw new Error(
+          (await response.json()).detail ?? `Server error ${response.status}`,
+        );
+    }
+    sourceSession = session;
+    activeSelection = null;
+    selectionVersion += 1;
+    loading = false;
+    bars = [];
+    breakoutEvents = [];
+    selectedEventId = null;
+    nextBefore = null;
+    hasMore = true;
+    initialized = false;
+    loadedBefores = [];
+    receiveIndicators([], false);
+    renderEventList();
+    redraw();
+    timeframes.replaceChildren();
+    symbolSelect.value = "";
+    legend.textContent = "Select a symbol and timeframe.";
+    sourceImportStatus.textContent = `Loaded ${files.length} source file${files.length === 1 ? "" : "s"}. Choose a symbol and timeframe.`;
+    void loadCatalog();
+  } catch (error) {
+    sourceImportStatus.textContent = `Folder import failed: ${error instanceof Error ? error.message : String(error)}`;
+  } finally {
+    sourceFolder.value = "";
+    sourceFolder.disabled = false;
+  }
+});
+
 storedFiles.addEventListener("change", async () => {
   if (importingStoredFiles) return;
   const selected = Array.from(storedFiles.files ?? []);
@@ -1619,6 +1699,7 @@ async function downloadFeatures(format) {
   exportStatus.textContent = "Preparing export…";
   try {
     const url = new URL("/api/v1/export", location.origin);
+    addSourceSession(url);
     url.searchParams.set("symbol", activeSelection.symbol);
     url.searchParams.set("timeframe", activeSelection.timeframe);
     url.searchParams.set("features", selected.join(","));

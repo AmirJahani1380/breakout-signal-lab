@@ -9,13 +9,16 @@ import pytest
 
 from app.bars import load_bars
 from app.feature_export import build_feature_frame
+from app.labels import LabelConfig
 from ML.research import (
     PREDICTORS,
+    ModelSettings,
     chronological_split,
     eligible_events,
     expanding_folds,
     export_events,
     predictors,
+    selected_feature_names,
 )
 
 
@@ -51,8 +54,51 @@ def test_strategy_exports_are_separate_and_signal_aligned(tmp_path: Path) -> Non
     with pytest.raises(FileExistsError):
         export_events(source, tmp_path / "output")
 
+    custom = export_events(
+        source,
+        tmp_path / "custom",
+        asset="GOLD",
+        strategies=("ema_breakout",),
+        feature_names=("body_to_range_ratio",),
+        label_config=LabelConfig(horizon=10),
+    )
+    custom_metadata = json.loads(Path(str(custom["ema_breakout"]) + ".json").read_text())
+    assert custom_metadata["dataset_id"] == "GOLD/D1"
+    assert custom_metadata["label_settings"]["horizon"] == 10
+    assert custom_metadata["model_predictors"] == ["body_to_range_ratio", "direction"]
+    assert (
+        len(
+            eligible_events(
+                pd.read_parquet(custom["ema_breakout"]), ("body_to_range_ratio", "direction")
+            )
+        )
+        > 0
+    )
+    configured_names = selected_feature_names(
+        ("atr_to_close", "ema_distance", "body_to_range_ratio"), {"atr_period": 14}
+    )
+    assert configured_names == (
+        "atr_14_to_close",
+        "ema_distance_20_atr_14",
+        "body_to_range_ratio",
+    )
+    configured = export_events(
+        source,
+        tmp_path / "configured",
+        strategies=("ema_breakout",),
+        feature_names=configured_names,
+        feature_settings={"atr_period": 14},
+    )
+    assert set(configured_names) <= set(pd.read_parquet(configured["ema_breakout"]).columns)
+    with pytest.raises(ValueError, match="unknown feature selection keys"):
+        selected_feature_names(("unknown",), {})
+    with pytest.raises(ValueError, match="unknown feature settings"):
+        selected_feature_names(("atr_to_close",), {"atr_period_typo": 14})
+
 
 def test_outcomes_and_purges_do_not_enter_predictors() -> None:
+    with pytest.raises(ValueError, match="test_fraction"):
+        ModelSettings(test_fraction=1)
     frame = pd.DataFrame(
         {
             "id": [str(index) for index in range(40)],

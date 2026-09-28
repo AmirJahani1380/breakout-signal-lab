@@ -1,119 +1,94 @@
-# Breakout Research Chart Viewer
+# Breakout Research
 
-A small FastAPI application that discovers symbol/timeframe CSV, Parquet, or XLSX filenames at startup and loads bars only after a chart selection. Calculated features use timestamp-aligned pandas tables and can be persisted as Parquet through PyArrow.
+**An end-to-end, event-driven quant research demo.** This repository is a focused slice of a larger research project. It demonstrates the path from validating market bars and designing signal-time features through breakout detection, fixed 2R outcome labels, interactive review, export, and a small supervised-learning experiment. It is a research workflow demonstration, not a deployable trading strategy.
 
-## Setup and run
+![Selected daily EMA breakout with modeled entry, stop, target, and broken level](docs/images/chart-events-initial.png)
 
-Python 3.11+ is required. The default data root is `C:\Users\amirj\OneDrive\Desktop\programming\Trade\data analysis\mt5_data`; set `BARS_DATA_ROOT` to use another directory. Changing either setting requires a restart.
+| Stage | What this demo shows |
+| --- | --- |
+| Market data | CSV, Parquet, and XLSX ingestion; UTC normalization and explicit OHLCV validation |
+| Features | Timestamp-aligned, nullable calculations including EMA, ATR, RSI, MACD, Donchian channels, confirmed swings, normalized candle measurements, rolling overlap, and volume |
+| Events | EMA close crossings and breakouts of previously confirmed swing levels, with configurable detector settings |
+| Labels and review | Next-bar entry, ATR-buffered stop, fixed 2R target, finite horizon, barrier-order handling, chart price lines, and signal-time event filters |
+| Research | Separate event cohorts, chronological and purged validation, a prevalence baseline, simple model selection, and untouched-test assessment |
+
+The viewer uses FastAPI, pandas, PyArrow, and TradingView Lightweight Charts. The [research notebook](ML/breakout_research.ipynb) uses scikit-learn, XGBoost, and Matplotlib. **Market data is supplied by the user and is not included in this repository.**
+
+## The workflow in the viewer
+
+**Feature design and visualization.** The Indicators panel applies chart views independently of export columns. This capture shows confirmed swing markers, Donchian bands, an EMA overlay, volume, and an RSI pane on the same daily series.
+
+![Applied swing, Donchian, EMA, volume, and RSI feature views](docs/images/chart-features.png)
+
+**Event detection and labeling.** The two detector switches and label settings below are live controls. Selecting a labeled event draws its modeled entry fill, stop, target, and broken level when available. The selected-event record also exposes signal and availability times, label status, return in R, and MAE/MFE. Missing label prices have no chart line.
+
+![Live EMA and swing detector controls, fixed 2R label settings, and modeled price lines](docs/images/chart-event-label-controls.png)
+
+**Signal-time filtering.** Feature conditions update the event list and chart markers. Here, `candle_direction = -1` narrows **195 loaded events to 86**. This is the loaded chart window, not the full research cohort.
+
+![Active candle-direction filter narrowing the loaded event list](docs/images/chart-feature-filter.png)
+
+## Research summary: XAUUSDzero daily breakouts
+
+**Question.** Do signal-time features rank fixed 2R target-first outcomes for EMA and confirmed-swing breakouts in XAUUSDzero daily bars? The historical source has SHA-256 fingerprint `473808c54e9cb2cdfc292524e59f94414f6aeb1b3fa2d1e9e802f3f19e0a7a89`. It is a single MT5-style market export, not an independently verified execution record.
+
+**Method.** The existing detectors and 30-bar labels yield 572 EMA and 252 swing events. Of these, 565 and 247 respectively have complete, unambiguous labels and finite signal-time predictors. Eight registered normalized features plus direction enter the models. The last 20% of eligible events is reserved as chronological test; development is purged of outcomes reaching test. Three expanding development folds, with purged training windows, select the model by mean Brier score. A favorable probability cutoff is selected by validation lift with at least 10 validation events; the untouched test is assessed once. Baseline Brier comes from a prevalence model fitted on development.
+
+The development count is **after purging events whose 30-bar outcomes reach the test boundary**. Out-of-fold (OOF) validation predictions come from expanding folds within development; they are not an additional cohort.
+
+| Detector | Eligible | Development after purge | OOF validation | Untouched test | Test dates (UTC) |
+| --- | ---: | ---: | ---: | ---: | --- |
+| EMA | 565 | 449 | 336 | 113 | 2023-04-28 to 2026-04-08 |
+| Confirmed swing | 247 | 196 | 147 | 50 | 2023-02-24 to 2026-03-18 |
+
+| Detector | Selected model | Test Brier: baseline / model ↓ | Test AP / prevalence ↑ | Validation cutoff (support) | Test selected (hits) |
+| --- | --- | ---: | ---: | ---: | ---: |
+| EMA | Prevalence | 0.1996 / 0.1996 | 0.2743 / 0.2743 | 0.3853 (112) | 0 (0) |
+| Confirmed swing | Shallow XGBoost | 0.2835 / 0.2329 | 0.7264 / 0.4800 | 0.2474 (80) | 34 (21) |
+
+**Finding and uncertainty.** The swing model ranks this single holdout better than its prevalence baseline, while EMA selects the prevalence model and its validation cutoff selects **zero** test events, so an EMA test-condition hit rate or lift is undefined. Swing's selected 21/34 test hit rate is descriptive. AP should be read beside cohort prevalence. Overlapping 30-bar outcomes, one historical market and test period, small selected counts, fixed barriers, zero modeled spread/slippage/commission, and possible regime change limit uncertainty estimates and forward inference. These labels do not establish live profitability.
+
+The following figures are extracted from the saved notebook outputs. Calibration points report bin support; development and untouched-test cohorts are shown separately.
+
+![Swing cohort calibration, precision-recall, and cumulative lift](docs/images/swing-calibration-precision-recall.png)
+
+![EMA cohort calibration, precision-recall, and cumulative lift](docs/images/ema-calibration-precision-recall.png)
+
+The swing outcome plot below is one example; both cohorts are documented in the linked notebook. It shows net R and adverse/favorable excursions. MAE and MFE span the available observation horizon, including bars after an earlier exit, and are never model inputs.
+
+![Swing cohort net R, MAE, and MFE distributions in development and test](docs/images/swing-outcomes.png)
+
+**Reproduce the research.** Install the optional ML dependencies with `pip install -e ".[ml]"`, edit `SOURCE_PATH` in the notebook's top config cell (or set `BREAKOUT_SOURCE` as an optional override), then run the linked notebook from top to bottom. Its top configuration cell exposes feature periods, stable `FEATURE_KEYS` for selecting predictors, detectors, labels, model settings, and an optional figure output location. Predictor column names are resolved from those keys after periods are applied, so changing `FEATURE_SETTINGS` updates names such as `atr_20_to_close` to `atr_14_to_close`. Saved outputs include the holdout table, both cohorts' figures, and audit details. Dataset fingerprints and run settings are checked before analysis. Prior research exports must be moved deliberately before regeneration from a different source or configuration.
+
+## Research design and boundaries
+
+- **Point-in-time inputs:** Eight normalized feature columns and event direction are available at signal time. Raw OHLC, timestamps, outcomes, returns, and excursion measures are excluded from model inputs.
+- **Events and labels:** An EMA event closes across its signal-bar EMA; a swing event closes across an earlier confirmed pivot. Signals are evaluated after the signal bar, with a **modeled next-open entry**. The stop sits beyond that bar's extreme by 0.05 × ATR(20), and the target is 2R away over a 30-bar entry-inclusive horizon. Gaps use their opening price; bars that touch both barriers without an opening resolution are ambiguous; incomplete windows are censored. Default modeled slippage and commission are zero.
+- **Evaluation:** EMA and swing events are separate cohorts. A prevalence baseline, a simple tree, and small XGBoost candidates are compared using three expanding, purged development folds. The final 20% chronological test window is scored once. Complete, unambiguous, finite-feature events alone enter modeling.
+- **Limits:** This is one gold daily series and one historical test period. Overlapping event horizons, small selected counts, regime changes, unmodeled spread and transaction costs, and absent portfolio sizing or execution simulation limit inference. The reported R values are label outcomes, not live or portfolio returns.
+
+## Reproduce the viewer
+
+Python 3.11+ is required. Supply your own CSV, Parquet, or XLSX market bars with UTC-compatible timestamps and OHLCV columns. The viewer validates the selected source and reports malformed rows. After starting the viewer, choose a folder in the browser or set `BARS_DATA_ROOT` to your market-data folder before launch. The chart library loads from a CDN.
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-pip install -e ".[dev]"
-npm ci
-npx playwright install chromium
-$env:BARS_DATA_ROOT = 'C:\market-data' # contains EURUSD_H1.csv/.parquet/.xlsx, etc.
-$env:SOURCE_TIMEZONE = 'UTC' # optional, applies only to naive timestamps
-uvicorn app.main:app --reload
+pip install -e .
+python -m uvicorn app.main:app --reload
 ```
 
-POSIX shells use `BARS_DATA_ROOT=/path/to/market-data SOURCE_TIMEZONE=UTC uvicorn app.main:app --reload`.
+Open <http://127.0.0.1:8000>. On macOS or Linux, activate the virtual environment with `source .venv/bin/activate` and set the variable with `export BARS_DATA_ROOT=/path/to/market-data`. Optional `SOURCE_TIMEZONE` applies to naive source timestamps; its default is UTC. The viewer supports interactive indicators, event selection and filters, and CSV/Parquet feature and event exports with metadata sidecars.
 
-On Windows, `run_chart_viewer.bat` also starts the server with auto reload. Stop the existing server before running it again; the launcher reports if port 8000 is already in use. The app sends `Cache-Control: no-store` for its page, static files, and API responses, so a normal Chrome refresh fetches current results. Changes to data-root settings still require a restart.
+In **Calculated** mode, use **Choose a folder of CSV, Parquet, or XLSX charts** to select local files without restarting the server. Files named like `EURUSD_H1.csv` or `EURUSD_H1_max_bars.csv` appear in the symbol and timeframe selectors; bars, events, and exports then use the chosen folder. The browser uploads these files to a temporary server session. Duplicate filenames or symbol/timeframe pairs produce an import error. Choose the folder again after a server restart or in a new browser tab.
 
-Open `http://127.0.0.1:8000`, choose a symbol, then choose one of its timeframes. The **Indicators** tab has numeric controls in each configurable indicator row for ATR, rolling overlap, RSI, EMA, and MACD fast/slow/signal periods; changing a setting reloads the chart and feature list. Feature names, export columns, and indicator labels include their selected periods. Filenames may be `SYMBOL_TIMEFRAME.csv` or the MT5 export form `SYMBOL_TIMEFRAME_max_bars.csv`; Parquet, XLSX, and hyphen-separated equivalents are also accepted. Startup only catalogs filenames, so an inaccessible or malformed unselected source does not block other datasets. `GET /api/v1/catalog` exposes available selections. `GET /api/v1/features` returns control metadata without calculating features; it accepts `atr_period`, `rolling_overlap_period`, `rsi_period`, `ema_period`, `macd_fast_period`, `macd_slow_period`, and `macd_signal_period` query parameters. `GET /api/v1/bars?symbol=EURUSD&timeframe=H1&limit=1000&features=volume,ema_20` returns at most 1,000 ascending display bars and calculates only the named feature views and their dependencies. Add `before=<exclusive UTC Unix seconds>` to request the next older page. Warm-up bars are never included in the displayed `bars` array.
+## Implementation and verification
 
-To inspect previously exported research values, set `STORED_DATA_ROOT` to a directory containing CSV or Parquet export files alongside their `.csv.json` or `.parquet.json` metadata sidecars, restart the server, and choose **Stored data** from Chart mode. This mode reads saved OHLCV and features without running feature calculators. The chart matches available indicator views to the exported feature names and period parameters, while the Stored values inspector shows every exported feature, including columns without a view and missing values. The heading shows the dataset identity, source SHA-256 as its dataset version, and each feature version. Integers beyond JavaScript's exact number range appear as strings in the inspector. The Export tab is disabled in stored mode. `GET /api/v1/catalog?mode=stored` lists these exports; `GET /api/v1/bars?mode=stored&symbol=XAUUSDzero&timeframe=D1` returns pages with `stored_values` and `stored_metadata`. A stored export must include a matching sidecar, exact identity and timestamp contract, declared columns and feature types, and chronological unique timestamps. The example at `tests/fixtures/stored_export.csv` is a three-row excerpt of the supplied XAUUSDzero D1 export, with one additional research-only value for inspector coverage. Stored exports are scanned from one directory; duplicate asset/timeframe exports are rejected at selection.
+The backend keeps source loading, feature calculations, event detection, labeling, and API transport separate. Timestamp-aligned nullable feature tables make missing warm-up values explicit. Event IDs are deterministic for the dataset and detector configuration; export sidecars record source hashes, feature versions, and label settings. Chart views and export columns are chosen independently.
 
-You can also import local files directly in the browser without configuring `STORED_DATA_ROOT`. Choose **Stored data**, then select one or more `.csv` or `.parquet` exports together with their matching `<export filename>.json` sidecars in the file picker. For example, select `bar_features.csv` and `bar_features.csv.json` together. For a multi-file batch, use distinct filenames for each export/sidecar pair; repeated default filenames from different folders cannot be matched by the browser picker, so import those pairs in separate batches. Each file reports its own success or validation error, and valid imports remain available in that browser tab after a refresh. The symbol and timeframe controls group imports using the exported asset/timeframe metadata, regardless of filenames. Imports remain accessible until the server restarts or the browser tab closes. They are held in server memory, which is cleared on restart; closing a tab does not immediately reclaim that memory. Imports are not copied into the configured data root.
+To run the repository checks, install the development dependencies with `pip install -e ".[dev,ml]"`, then install the browser test tools with `npm ci` and `npx playwright install chromium`.
 
-Use the Indicators tab to apply, hide, or remove features. Every control names its visualization: EMA is a line, RSI is a pane, candle range is crosshair-only, and engulfing is candle color. A disabled feature is removed immediately from chart series, candle colors, and crosshair details. Enabling engulfing colors matching candles yellow; disabling it restores the normal up/down colors. Other candle measurements remain crosshair-only and add no chart series.
-
-## Events
-
-The **Events** tab offers independent EMA and confirmed swing breakout detectors. The **Indicators** tab offers adjustable **Confirmed swings** markers and a Donchian channel with upper, lower, and midpoint price overlays. Event signals use green upward arrows for bullish events and red downward arrows for bearish events; swing highs use blue circles and swing lows use purple squares. The chart key names these marks and distinguishes Donchian rolling edges from confirmed swing breakout levels. The Events panel sits beside the chart on wide screens and above it on narrow screens. Search the event list by type, direction, time, or price, or filter it by UTC date. Add feature filters to combine signal-bar conditions with AND: for example, set `candle_direction = 1`, `ema_slope_20_20_atr_20 > 0.12`, and `atr_20 > 1.5`. Numeric features offer comparisons and boolean features accept `true` or `false`; either type can be filtered for missing or present values. The count shows matching events divided by all loaded events, with a percentage; it changes when older pages load. Only active filter features are calculated. Filters affect both the list and chart arrows, while Clear filters restores the loaded events. Changing indicator periods keeps compatible filters and flags any unavailable feature for correction. Previous/Next navigate the filtered list. Select an event to see its exact setup, signal and availability times, broken level and a chart level line when one exists. Event detector choices and breakout settings are in disclosure controls. Events are available for calculated source data. `GET /api/v1/events?symbol=EURUSD&timeframe=H1&limit=1000` returns records and pivot markers for the same display window as `/api/v1/bars`; `before` is an exclusive timestamp cursor. Pass comma-separated `features` to include each requested feature's signal-bar value in each event's `feature_values`; unknown or duplicate names return HTTP 422. The detector and feature lists come from `/api/v1/features` as `event_detectors` and `export_features`.
-
-EMA uses the existing EMA calculation seeded from the first close of the **complete selected source**, default period 20. A bullish signal requires the signal candle's open strictly below its EMA minus the price buffer and its close strictly above its EMA plus the buffer; bearish is the inverse. The broken level is the EMA value on the signal candle. Equality on either side produces no event. An intrabar wick without a qualifying open and close does not signal.
-
-A swing high has a high strictly greater than the highs of the preceding `left` and following `right` bars; a swing low uses strictly smaller lows. Equal highs or lows anywhere in that window reject that pivot. Defaults are `left=3` and `right=3`: three bars on each side of the pivot. A pivot is confirmed at the close of its third right-hand bar. For signal candle `i`, the swing breakout searches pivot candles `i - lookback` through `i - 1`, inclusive, using only pivots confirmed no later than candle `i - 1`. The upper level is the highest eligible swing high; the lower level is the lowest eligible swing low. The default lookback is 20 completed candles. If no qualifying pivot exists on a side, that side cannot signal. A bullish event requires the signal open strictly below the upper level minus the buffer and signal close strictly above the upper level plus the buffer; bearish uses the lower level in reverse. Equality never signals. The current candle cannot form or confirm its own level. `confirmed_swing_high_3_3` and `confirmed_swing_low_3_3` feature columns store the frozen level on the **confirmation** bar, while the swing indicator draws dots on pivot candles. Swing settings in Events accept a 1–1000 candle lookback and 1–100 bars per side. The Indicators tab has a separate symmetric swing period control (default 3, range 1–100).
-
-The Donchian channel uses the highest high and lowest low of the current candle and preceding `period - 1` candles, with midpoint `(upper + lower) / 2`. Its default window is 20 candles and can be adjusted in the Indicators tab. The first `period - 1` points are unavailable. Donchian values are conventional rolling price levels; the swing breakout uses only confirmed pivots in its trailing window, so its broken level can differ from the plotted Donchian edge.
-
-The price buffer defaults to 0 and is an absolute price amount, not a percentage. It must be finite and non-negative. EMA period accepts 1–1000; swing left/right accept 1–100 in the Events UI. These values are sent as `ema_period`, `swing_lookback`, `swing_left`, `swing_right`, and `buffer`. Event records include a deterministic ID scoped to dataset, detector configuration, direction, setup and signal time; direction, setup ID, signal and availability times, optional broken level, signal close and reason are explicit. The ID and event membership do not depend on chart page size. Calculating from the complete selected source means adding or changing later bars cannot change earlier events.
-
-The Export tab can download **encountered events** as a separate CSV or Parquet ZIP. Choose event detectors and optional feature columns, then use the event download buttons. This export includes one row per signal with the event fields, asset/timeframe, canonical signal bar OHLCV, selected feature values calculated from the source start, and a JSON schema sidecar. It does not alter the existing bar feature export. The matching API is `GET /api/v1/events/export?symbol=EURUSD&timeframe=H1&detectors=ema_breakout,swing_breakout&features=ema_20&format=csv`.
-
-Each event also receives a fixed 2R label from the full source history. The immediate next bar is the only entry opportunity, at its open with adverse slippage; an event on the final bar is `unfilled`. The stop is below the signal low for a bullish long or above the signal high for a bearish short, offset by `label_atr_buffer` times signal-bar Wilder ATR (or one representable price step when the buffer is zero). Defaults are `label_atr_period=20`, `label_atr_buffer=0.05`, `label_horizon=30` entry-inclusive bars, `label_slippage=0`, and `label_commission=0`; all can be set in the Events panel or passed to both event endpoints. ATR unavailable/zero, non-positive actual entry-to-stop distance, or non-finite derived label arithmetic gives `invalid_entry` with a reason. The target is exactly twice that distance from the slipped entry fill. Later opening gaps through a barrier fill at the opening price before intrabar high/low checks. A bar touching both barriers without an opening resolution is `ambiguous` and conservatively priced at the stop; single hits are `target_first` or `stop_first`. Otherwise, a complete holding window exits `timeout` at its final close; an incomplete window is `censored` with no outcome R. `gross_r` includes adverse entry and exit slippage once; `net_r` subtracts one commission per side, both expressed in price units divided by actual risk. `mae_price`/`mfe_price` and their `_r` counterparts measure excursions over the full available entry-inclusive horizon, even after an earlier exit; `horizon_complete` shows whether that window is complete. Entry, barriers, exit, observation end, status, configuration and excursions appear in both event exports and the chart's selected event details. The Events panel has a Download labels CSV button for the selected detectors.
-
-The Export tab selects feature **columns** independently of the Indicators tab. Choose a dataset, check one or more columns, and download CSV or Parquet. Each download is a ZIP containing exactly `bar_features.csv` or `bar_features.parquet` and its `bar_features.<format>.json` sidecar. The table contains asset, timeframe, UTC Unix-second timestamp, canonical OHLCV, and the selected columns. `volume` is already canonical and appears once if selected. Rows are chronological; asset, timeframe, and timestamp identify them. The sidecar records dataset identity, SHA-256 source fingerprint, timestamp and null conventions, declared dtypes, feature versions and parameters, and numeric tolerance (`1e-12` relative and absolute). CSV empty fields and Parquet nulls represent missing values. Read CSV using the sidecar dtypes, especially nullable booleans and integers.
-
-For scripts, `app.feature_export.export_bar_features(source_path, output_directory, asset, timeframe, feature_names, format)` writes the same table and sidecar and raises `FileExistsError` if either destination already exists. EMA starts from the first close; ATR uses the first selected-period true ranges; RSI uses the first selected-period close changes; rolling overlap uses the previous selected number of complete bars. The exporter calculates from the beginning of the source, then withholds the selected features' full warm-up (at least 100 source rows for recursive indicators, increased when a selected period is larger; the selected number of rows for rolling overlap) so the CSV does not begin with unavailable seed values. The sidecar records this as `export_warm_up_rows`.
-
-## Loading, paging, and warm-up policy
-
-This experimental app deliberately has no dataset, page, or calculation cache. Each bars request loads the selected CSV, Parquet, or XLSX file with pandas, validates the complete selected dataset, and then slices the requested ascending page in memory. It does not open unselected datasets. Older pages use an exclusive timestamp cursor, so adjacent pages do not overlap and the browser can prepend history without duplicate timestamps. Source and validation errors return HTTP 422 for the selected dataset.
-
-EMA, RSI, MACD, and ATR use a bounded seed window on every page: at least 100 bars, increased to the selected indicator period where needed; engulfing uses one preceding candle and rolling overlap uses the selected period. These recursive values are deterministic for that declared boundary policy, but they are not claimed to be mathematically identical to calculations seeded from the complete history. At the beginning of a dataset, only the available seed rows are used.
-
-ATR uses Wilder smoothing. The first true range is the first candle's high minus low; later true ranges are the maximum of high minus low and the distances from the previous close to high and low. For selected period `p`, the first ATR is the arithmetic mean of `p` true ranges at candle `p` (index `p - 1`), so earlier values are null. Each later ATR is `(previous ATR * (p - 1) + current true range) / p`. `atr_p_to_close` divides by the current close. Candle range, body size, upper wick, and lower wick are each divided independently by ATR `p` and by the current close. A zero denominator or unavailable ATR yields null. These values are optional crosshair details; ATR also has an optional pane. The default period is 20.
-
-`ema_distance_p_atr_a` is `(close - EMA p) / ATR a`; `ema_slope_p_n_atr_a` is `((EMA p now - EMA p from n bars earlier) / n) / ATR a`. ATR uses Wilder smoothing from the same bar as the numerator. Distance is in ATR multiples and slope is in ATR multiples per bar. Both are signed by default, so negative values mean close below EMA or falling EMA; each has an **Absolute** checkbox that removes the sign and adds `_absolute` to its column name. Both appear as optional panes and export columns. They share the EMA and ATR period controls (both default 20); `ema_slope_bars` sets `n` from 1 to 500 (default 20). Values are null before the ATR or slope history is available and when ATR is zero. Export withholds at least 100 seed rows, increasing that to `p + n` or `a` when larger and slope is selected.
-
-`rolling_overlap_p` uses only the previous `p` completed candles. It spans their minimum low to maximum high with `p` equal-width bins and samples each midpoint. At each midpoint, the contribution is `max(number of candle ranges containing that price - 1, 0) / (p - 1)`; the score is the mean of the `p` contributions, between 0 and 1. Identical ranges score 1, separated ranges score 0, and greater shared coverage raises the score. Insufficient or invalid history yields null; a valid zero-width window scores 1. This is a `p`-point approximation, so a narrow shared region can fall between sample points. The optional histogram uses distinct translucent colors above and below 0.5; exactly 0.5 uses the chart's default color. The default period is 20.
-
-## Feature architecture
-
-Each calculation lives in its own `app/features` module and exports a `FeatureDefinition`. A definition separates calculation metadata (`FeatureSpec`) from rendering and crosshair metadata (`FeatureViewSpec`). Calculations return a `FeatureTable` whose integer Unix timestamp index exactly matches the source bars; warm-up rows remain nullable. Views only format columns already present in that table, and only views with an explicit renderer are plotted.
-
-To add an indicator, create a module in `app/features/` that exports `feature = FeatureDefinition(...)`; discovery adds it to the chart and export catalog. For a numeric control, give the definition a `FeatureSetting` in `settings` and a `configure` callback that returns a definition for the requested values. Record those values in each `FeatureSpec.parameters`, and give changing feature columns and views stable `selection_key` values so checked exports and applied views survive a settings change. The API and browser build controls from these declarations; adding an indicator requires no edits to `app/main.py`, `static/app.js`, or `static/index.html`. If a calculation needs preceding bars, declare its warm-up and return an aligned `FeatureTable`; export uses the feature's calculator for the full source history. Views that place a mark on a historical bar after later confirmation declare `calculation_look_ahead` so marks remain visible across chart page boundaries; those later bars are never included in the displayed page.
-
-Event detectors use the same drop-in pattern. Add one Python module under `app/event_detectors/` and export `detector = EventDetector(identifier, label, detect)`. `detect` receives `(bars: Sequence[Bar], config: EventConfig, dataset_id: str)` and returns records from `make_event(detector, direction, signal, broken_level, setup_id, availability_time, configuration, dataset_id, reason=None)`. Use a stable lowercase identifier and `bullish` or `bearish` direction. The helper supplies shared fields and a deterministic dataset-scoped ID. Set `broken_level=None` for events without a crossed level; the chart then omits the level line.
-
-A detector may declare numeric controls with `DetectorSetting(name, label, default, minimum=None, maximum=None)` in `EventDetector(..., settings=(...))`. The API validates each `detector_id.setting_name` query value and passes it through `config.detector_settings`; the frontend builds controls from the detector catalog. Detector modules are discovered at startup and automatically appear in `/api/v1/features`, the Events controls, and event exports. No other file needs editing to add a detector. Restart the app after adding a module. Invalid modules are skipped with a warning naming the module and contract error; invalid returned events receive a detector-named API error.
-
-```python
-table.to_parquet("features.parquet")
-restored = FeatureTable.from_parquet("features.parquet")
-```
-
-Feature dtypes use pandas nullable `Float64`, `Int64`, or `boolean` types so nulls and logical types survive the Parquet round trip. A view may render a line, histogram, a Lightweight Charts series marker without a connecting line, a separate pane, or nothing, and crosshair visibility is configured independently. A null color feature omits the per-point color so the chart renderer can use its default. See the bundled feature modules for concise definitions. Invalid modules or non-finite calculated values are skipped with a warning naming the problem.
-
-## CSV, Parquet, and XLSX format
-
-CSV, Parquet, and XLSX share the same pandas-backed normalization contract. Sources must include exact names `time`, `open`, `high`, `low`, `close`, and either `volume` or `tick_volume` (when both exist, `volume` wins). The first XLSX worksheet uses the same canonical names. Timestamps accept ISO-8601 strings, UTC Unix seconds, or UTC Unix milliseconds; values with sub-second precision are rejected. Naive ISO values use `SOURCE_TIMEZONE`, whose default is `UTC`.
-
-Additional CSV and Parquet columns are retained in `BarStore.imported_features`, indexed by normalized UTC timestamp and marked with imported provenance. They remain separate from canonical bars and computed `FeatureTable` columns, so a vendor column such as `candle_range` cannot overwrite the computed value and is not automatically displayed. Use `imported_feature_column`, `computed_feature_column`, and `compare_feature_columns` from `app.features.comparison` to compare matching columns. Numeric values use configurable relative and absolute tolerances; boolean and categorical values compare exactly. Missing timestamps and differing values are returned in the comparison result without changing either source.
-
-`is_engulfing` is true for a bullish reversal when the previous candle is bearish, the current candle is bullish, its open is strictly inside the previous candle's low/high range, and its close is above the previous high. The bearish rule is the inverse: previous bullish, current bearish, open strictly inside the previous range, and close below the previous low. It only uses the current and preceding bars; all bundled candle calculations are causal.
-
-Selecting a timeframe validates the complete selected source, including timestamp syntax and order, duplicate timestamps, numeric price/volume values, and OHLC geometry. An unavailable data root returns HTTP 503; an invalid selection or malformed source returns a clear HTTP 422 response with its original source row or CSV record number.
-
-## Breakout ML research
-
-Install `pip install -e ".[ml]"` and open `ML/breakout_research.ipynb` from the repository root.
-The notebook reads the canonical `XAUUSDzero_D1_max_bars.csv` in the sibling
-`data analysis/mt5_data` directory by default. Set `BREAKOUT_SOURCE` to another
-copy of that XAUUSDzero D1 source before starting Jupyter if needed. Its first run writes separate
-`exports/ML/ema_breakout.parquet` and `exports/ML/swing_breakout.parquet` with
-JSON sidecars; these ignored research outputs are never replaced automatically.
-Delete or move an old pair deliberately to regenerate after source or code changes.
-The sidecars record the source SHA-256 and the exact feature, detector and label
-settings. The notebook checks that fingerprint before analysis.
-
-Only the eight registered, signal-time normalized features and event direction
-enter the models. OHLC/raw prices, timestamps, entry/exit fields, MAE/MFE,
-returns, and outcomes remain audit data, not predictors. Complete 30-bar `target_first` events are 1; complete
-`stop_first` and `timeout` events are 0. Ambiguous, censored, unfilled,
-invalid-entry and missing-feature events are counted but not modeled. Fixed
-2R labels use 20-bar ATR, 0.05 ATR stop buffer, zero slippage and zero
-commission. Net R therefore has zero transaction costs. MAE/MFE are descriptive
-R-multiple excursions over the entire available observation window, including
-bars after an early exit; they are not model inputs. This is one market's
-observational backtest, not evidence of live execution or future profitability.
-
-## Verification
-
-```powershell
+```text
 pytest
 ruff format --check .
 ruff check .

@@ -38,9 +38,7 @@ from .features import (
 from .features.configuration import configure_features, configure_stored_features, settings_catalog
 from .stored_data import StoredDataError, StoredDataset, load_stored_dataset
 
-DEFAULT_DATA_ROOT = Path(
-    r"C:\Users\amirj\OneDrive\Desktop\programming\Trade\data analysis\mt5_data"
-)
+DEFAULT_DATA_ROOT = Path("market_data")
 STATIC_DIRECTORY = Path(__file__).parent.parent / "static"
 PAGE_SIZE = 1000
 
@@ -50,6 +48,12 @@ class StoredImport(BaseModel):
     filename: str
     content_base64: str
     metadata_json: str
+
+
+class SourceImport(BaseModel):
+    session_id: UUID
+    filename: str
+    content_base64: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -75,15 +79,33 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.features = discover()
         app.state.event_detectors = discover_detectors()
         app.state.imported_datasets = {}
-        try:
-            app.state.catalog = discover_source_catalog(configured_settings.data_root)
-            app.state.source_error = None
-        except SourceValidationError as error:
-            app.state.catalog = None
-            app.state.source_error = str(error)
-        yield
+        app.state.imported_source_catalogs = {}
+        with tempfile.TemporaryDirectory() as source_directory:
+            app.state.source_directory = Path(source_directory)
+            try:
+                app.state.catalog = discover_source_catalog(configured_settings.data_root)
+                app.state.source_error = None
+            except SourceValidationError as error:
+                app.state.catalog = None
+                app.state.source_error = str(error)
+            yield
 
     app = FastAPI(title="Breakout Research Chart Viewer", lifespan=lifespan)
+
+    def source_catalog(request: Request) -> SourceCatalog:
+        session = request.query_params.get("source_session")
+        if session is not None:
+            try:
+                catalog = app.state.imported_source_catalogs.get(UUID(session))
+            except ValueError as error:
+                raise HTTPException(status_code=422, detail="Invalid source session") from error
+            if catalog is None:
+                raise HTTPException(status_code=422, detail="Selected source folder is unavailable")
+            return cast(SourceCatalog, catalog)
+        configured_catalog = cast(SourceCatalog | None, app.state.catalog)
+        if configured_catalog is None:
+            raise HTTPException(status_code=503, detail=app.state.source_error)
+        return configured_catalog
 
     @app.middleware("http")
     async def prevent_browser_cache(
@@ -95,6 +117,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.get("/api/v1/catalog")
     def catalog(
+        request: Request,
         mode: Literal["source", "stored"] = "source",
         import_session: UUID | None = None,
     ) -> dict[str, object]:
@@ -117,12 +140,38 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     for asset, times in sorted(grouped.items())
                 ]
             }
-        source_catalog: SourceCatalog | None = app.state.catalog
-        if source_catalog is None:
+        return {"symbols": source_catalog(request).symbols()}
+
+    @app.post("/api/v1/source/import")
+    def import_source(payload: SourceImport) -> dict[str, object]:
+        filename = payload.filename
+        if Path(filename).name != filename or Path(filename).suffix.lower() not in {
+            ".csv",
+            ".parquet",
+            ".xlsx",
+        }:
             raise HTTPException(
-                status_code=503, detail=app.state.source_error or "data root unavailable"
+                status_code=422,
+                detail="Choose a CSV, Parquet, or XLSX source filename without directories",
             )
-        return {"symbols": source_catalog.symbols()}
+        try:
+            content = base64.b64decode(payload.content_base64, validate=True)
+            if not content:
+                raise ValueError("source file is empty")
+            directory = app.state.source_directory / str(payload.session_id)
+            directory.mkdir(exist_ok=True)
+            path = directory / filename
+            with path.open("xb") as stream:
+                stream.write(content)
+            try:
+                catalog = discover_source_catalog(directory)
+            except SourceValidationError:
+                path.unlink()
+                raise
+            app.state.imported_source_catalogs[payload.session_id] = catalog
+            return {"symbols": catalog.symbols()}
+        except (OSError, binascii.Error, ValueError, SourceValidationError) as error:
+            raise HTTPException(status_code=422, detail=f"{filename}: {error}") from error
 
     @app.get("/api/v1/features")
     def features(request: Request) -> dict[str, object]:
@@ -155,7 +204,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             ],
         }
 
-    register_event_routes(app, configured_settings.source_timezone, PAGE_SIZE)
+    register_event_routes(app, configured_settings.source_timezone, PAGE_SIZE, source_catalog)
 
     @app.post("/api/v1/stored/import")
     def import_stored(payload: StoredImport) -> dict[str, object]:
@@ -195,13 +244,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         features: str = Query(min_length=1),
         output_format: str = Query(alias="format", pattern="^(csv|parquet)$"),
     ) -> Response:
-        source_catalog: SourceCatalog | None = app.state.catalog
-        if source_catalog is None:
-            raise HTTPException(
-                status_code=503, detail=app.state.source_error or "data root unavailable"
-            )
         try:
-            selection = source_catalog.selection(symbol, timeframe)
+            selection = source_catalog(request).selection(symbol, timeframe)
             names = features.split(",")
             with tempfile.TemporaryDirectory() as directory:
                 table, sidecar = export_bar_features(
@@ -259,13 +303,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 return dataset.page(before, limit, definitions)
             except (OSError, StoredDataError, ValueError) as error:
                 raise HTTPException(status_code=422, detail=str(error)) from error
-        source_catalog: SourceCatalog | None = app.state.catalog
-        if source_catalog is None:
-            raise HTTPException(
-                status_code=503, detail=app.state.source_error or "data root unavailable"
-            )
         try:
-            selection = source_catalog.selection(symbol, timeframe)
+            selection = source_catalog(request).selection(symbol, timeframe)
         except (OSError, SourceValidationError) as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         try:

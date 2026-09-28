@@ -1,5 +1,7 @@
+import base64
 from collections.abc import Sequence
 from pathlib import Path
+from uuid import uuid4
 
 import pandas as pd
 import pytest
@@ -49,6 +51,38 @@ def test_catalog_lists_filenames_without_loading_bars(
     assert response.json() == {"symbols": [{"symbol": "EURUSD", "timeframes": ["H1"]}]}
     with pytest.raises(bars_module.SourceValidationError):
         bars_module.load_bars(malformed_source)
+
+
+def test_selected_source_folder_is_used_for_bars_and_events(tmp_path: Path) -> None:
+    source = write_csv(tmp_path / "EURUSD_H1.csv", [valid(100), valid(101)])
+    session = str(uuid4())
+    payload = {
+        "session_id": session,
+        "filename": source.name,
+        "content_base64": base64.b64encode(source.read_bytes()).decode("ascii"),
+    }
+    with TestClient(create_app(Settings(tmp_path / "missing"))) as client:
+        assert client.get("/api/v1/catalog").status_code == 503
+        assert client.post("/api/v1/source/import", json=payload).status_code == 200
+        query = f"source_session={session}&symbol=EURUSD&timeframe=H1"
+        assert client.get(f"/api/v1/catalog?source_session={session}").json() == {
+            "symbols": [{"symbol": "EURUSD", "timeframes": ["H1"]}]
+        }
+        assert len(client.get(f"/api/v1/bars?{query}").json()["bars"]) == 2
+        assert client.get(f"/api/v1/events?{query}").status_code == 200
+        assert (
+            client.get(
+                f"/api/v1/bars?source_session={uuid4()}&symbol=EURUSD&timeframe=H1"
+            ).status_code
+            == 422
+        )
+        assert client.post("/api/v1/source/import", json=payload).status_code == 422
+        assert (
+            client.post(
+                "/api/v1/source/import", json={**payload, "filename": "../bad.csv"}
+            ).status_code
+            == 422
+        )
 
 
 def test_selected_dataset_pages_without_loading_another_dataset(
