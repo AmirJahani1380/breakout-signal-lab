@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from math import isfinite
+from math import inf, isfinite, nextafter
 from typing import cast
 
 from app.bars import Bar
@@ -14,7 +14,7 @@ from app.features.atr import atr_values
 
 @dataclass(frozen=True, slots=True)
 class LabelConfig:
-    horizon: int = 20
+    horizon: int = 30
     atr_period: int = 20
     atr_buffer: float = 0.05
     slippage: float = 0.0
@@ -127,6 +127,10 @@ def label_events(
             if direction == 1
             else (signal.high + config.atr_buffer * signal_atr)
         )
+        if direction == 1 and stop >= signal.low:
+            stop = nextafter(signal.low, -inf)
+        elif direction == -1 and stop <= signal.high:
+            stop = nextafter(signal.high, inf)
         risk = direction * (entry_fill - stop)
         if not all(isfinite(value) for value in (entry_fill, stop, risk)):
             record.update(

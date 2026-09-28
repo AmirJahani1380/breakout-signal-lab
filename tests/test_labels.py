@@ -23,6 +23,65 @@ def outcome(source: list[Bar], direction: str = "bullish", **settings: object) -
     return label_events(source, [event], LabelConfig(atr_period=1, **settings))[0]  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize(
+    ("direction", "source", "entry", "stop", "risk", "target", "mae", "mfe"),
+    [
+        (
+            "bullish",
+            [bar(1, 100, 104, 98, 103), bar(2, 105, 109, 102, 108)],
+            105,
+            97.7,
+            7.3,
+            119.6,
+            3,
+            4,
+        ),
+        ("bearish", [bar(1, 100, 102, 96, 97), bar(2, 95, 99, 91, 92)], 95, 102.3, 7.3, 80.4, 4, 4),
+    ],
+)
+def test_hand_calculated_next_open_stop_risk_target_and_excursions(
+    direction: str,
+    source: list[Bar],
+    entry: float,
+    stop: float,
+    risk: float,
+    target: float,
+    mae: float,
+    mfe: float,
+) -> None:
+    result = outcome(source, direction, atr_buffer=0.05, horizon=1)
+    assert result["entry_time"] == 2
+    assert result["entry_open"] == entry
+    assert result["entry_fill"] == entry
+    assert result["stop_price"] == pytest.approx(stop)
+    assert result["risk_price"] == pytest.approx(risk)
+    assert result["target_price"] == pytest.approx(target)
+    assert result["mae_price"] == mae
+    assert result["mfe_price"] == mfe
+    assert result["mae_r"] == pytest.approx(mae / risk)
+    assert result["mfe_r"] == pytest.approx(mfe / risk)
+    assert result["label_status"] == "timeout"
+
+
+def test_default_horizon_is_thirty_entry_inclusive_bars() -> None:
+    source = [bar(1, 10, 11, 9, 10)] + [bar(i, 10, 10.5, 9.5, 10) for i in range(2, 32)]
+    result = outcome(source)
+    assert LabelConfig().horizon == 30
+    assert result["label_config"]["horizon"] == 30
+    assert result["planned_end_time"] == 31
+    assert result["observation_end_time"] == 31
+    assert result["label_status"] == "timeout"
+
+
+@pytest.mark.parametrize("direction", ["bullish", "bearish"])
+def test_zero_buffer_still_places_stop_beyond_signal_extreme(direction: str) -> None:
+    result = outcome([bar(1, 10, 11, 9, 10), bar(2, 10, 10.5, 9.5, 10)], direction, atr_buffer=0)
+    if direction == "bullish":
+        assert result["stop_price"] < 9
+    else:
+        assert result["stop_price"] > 11
+
+
 def test_long_short_entry_bar_hits_and_costs() -> None:
     long = outcome(
         [bar(1, 10, 11, 9, 10), bar(2, 10, 15, 9.5, 14)],
@@ -33,7 +92,7 @@ def test_long_short_entry_bar_hits_and_costs() -> None:
     )
     assert long["label_status"] == "target_first"
     assert long["entry_fill"] == pytest.approx(10.1)
-    assert long["stop_price"] == 9
+    assert long["stop_price"] == pytest.approx(9)
     assert long["target_price"] == pytest.approx(12.3)
     assert long["gross_r"] == pytest.approx((12.3 - 0.1 - 10.1) / 1.1)
     assert long["net_r"] == pytest.approx((12.3 - 0.1 - 10.1 - 0.1) / 1.1)
@@ -44,7 +103,7 @@ def test_long_short_entry_bar_hits_and_costs() -> None:
         [bar(1, 10, 11, 9, 10), bar(2, 10, 10.5, 7, 8)], "bearish", horizon=1, atr_buffer=0
     )
     assert short["label_status"] == "target_first"
-    assert short["target_price"] == 8
+    assert short["target_price"] == pytest.approx(8)
     assert short["gross_r"] == 2
 
 
@@ -59,7 +118,9 @@ def test_opening_gaps_precede_intrabar_and_dual_hit_is_ambiguous() -> None:
     )
     assert (gap_stop["label_status"], gap_stop["exit_fill"]) == ("stop_first", 8)
     dual = outcome([signal, bar(2, 10, 13, 8, 10)], horizon=1, atr_buffer=0)
-    assert (dual["label_status"], dual["exit_fill"], dual["gross_r"]) == ("ambiguous", 9, -1)
+    assert dual["label_status"] == "ambiguous"
+    assert dual["exit_fill"] == pytest.approx(9)
+    assert dual["gross_r"] == -1
     short_gap = outcome(
         [signal, bar(2, 10, 10.5, 9.5, 10), bar(3, 7, 12, 6, 10)],
         "bearish",
@@ -113,7 +174,7 @@ def test_event_api_and_csv_parquet_exports_share_labels(tmp_path) -> None:
     params = {
         "symbol": "TEST",
         "timeframe": "H1",
-        "detectors": "three_bullish_candles",
+        "detectors": "ema_breakout",
         "label_atr_period": 1,
         "label_horizon": 2,
     }
@@ -148,25 +209,25 @@ def test_finite_source_prices_that_overflow_target_stay_exportable(tmp_path) -> 
         "time,open,high,low,close,volume\n"
         "1,1e307,2e307,1e307,2e307,1\n"
         "2,2e307,3e307,2e307,3e307,1\n"
-        "3,3e307,4e307,3e307,4e307,1\n"
+        "3,2e307,4e307,2e307,4e307,1\n"
         "4,1.3e308,1.4e308,1.2e308,1.3e308,1\n",
         encoding="utf-8",
     )
     params = {
         "symbol": "LARGE",
         "timeframe": "H1",
-        "detectors": "three_bullish_candles",
+        "detectors": "ema_breakout",
         "label_atr_period": 1,
     }
     with TestClient(create_app(Settings(root))) as client:
         response = client.get("/api/v1/events", params=params)
         assert response.status_code == 200
         records = response.json()["events"]
-        assert len(records) == 1
-        assert records[0]["label_status"] == "invalid_entry"
-        assert records[0]["label_reason"] == "derived target is non-finite"
-        assert records[0]["target_price"] is None
-        assert records[0]["net_r"] is None
+        record = next(event for event in records if event["signal_time"] == 3)
+        assert record["label_status"] == "invalid_entry"
+        assert record["label_reason"] == "derived target is non-finite"
+        assert record["target_price"] is None
+        assert record["net_r"] is None
         for format in ("csv", "parquet"):
             export = client.get("/api/v1/events/export", params={**params, "format": format})
             assert export.status_code == 200
@@ -176,10 +237,10 @@ def test_finite_source_prices_that_overflow_target_stay_exportable(tmp_path) -> 
                     if format == "csv"
                     else pd.read_parquet(io.BytesIO(archive.read("encountered_events.parquet")))
                 )
-            assert frame.loc[0, "id"] == records[0]["id"]
-            assert frame.loc[0, "label_status"] == "invalid_entry"
-            assert pd.isna(frame.loc[0, "target_price"])
-            assert pd.isna(frame.loc[0, "net_r"])
+            exported = frame.loc[frame["id"] == record["id"]].iloc[0]
+            assert exported["label_status"] == "invalid_entry"
+            assert pd.isna(exported["target_price"])
+            assert pd.isna(exported["net_r"])
 
 
 def test_other_finite_input_overflows_are_invalid_without_nonfinite_fields() -> None:

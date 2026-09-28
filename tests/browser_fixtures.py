@@ -109,15 +109,6 @@ def viewer_url(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
             for index, close in enumerate(pivot_closes)
         ],
     )
-    write_csv(
-        root / "CANDLES_H1.csv",
-        [
-            (1_735_689_600 + index * 60, opening, closing + 1, opening - 1, closing, 1)
-            for index, (opening, closing) in enumerate(
-                [(1, 2), (2, 3), (3, 4), (4, 4), (4, 5), (5, 6), (6, 7)]
-            )
-        ],
-    )
     port = free_port()
     process = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "app.main:app", "--port", str(port)],

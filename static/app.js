@@ -69,6 +69,12 @@ const exportEventsCsv = /** @type {HTMLButtonElement} */ (
 const exportEventsParquet = /** @type {HTMLButtonElement} */ (
   document.querySelector("#export-events-parquet")
 );
+const exportLabelsCsv = /** @type {HTMLButtonElement} */ (
+  document.querySelector("#export-labels-csv")
+);
+const exportLabelsStatus = /** @type {HTMLElement} */ (
+  document.querySelector("#export-labels-status")
+);
 const dataModeElement = document.querySelector("#data-mode");
 const datasetVersionElement = document.querySelector("#dataset-version");
 const valueInspectorElement = document.querySelector("#value-inspector");
@@ -230,7 +236,6 @@ function renderEventMarkers() {
       price: event.breakout_price,
       shape: event.direction === "bullish" ? "arrowUp" : "arrowDown",
       color: event.direction === "bullish" ? "#00c853" : "#ef5350",
-      text: event.label_status,
     }))
     .sort((left, right) => left.time - right.time);
   breakoutMarkers.setMarkers(markers);
@@ -1283,25 +1288,28 @@ exportTab.addEventListener("click", () => {
   eventsTab.setAttribute("aria-selected", "false");
 });
 
-/** @param {"csv"|"parquet"} format */
-async function downloadEvents(format) {
+/** @param {"csv"|"parquet"} format @param {string[]=} selectedIds */
+async function downloadEvents(format, selectedIds) {
+  const status = selectedIds === undefined ? exportStatus : exportLabelsStatus;
   if (!activeSelection) {
-    exportStatus.textContent = "Select a dataset first.";
+    status.textContent = "Select a dataset first.";
     return;
   }
-  const detectors = Array.from(
-    exportEventDetectors.querySelectorAll("input:checked"),
-    (input) => /** @type {HTMLInputElement} */ (input).value,
-  );
+  const detectors =
+    selectedIds ??
+    Array.from(
+      exportEventDetectors.querySelectorAll("input:checked"),
+      (input) => /** @type {HTMLInputElement} */ (input).value,
+    );
   if (!detectors.length) {
-    exportStatus.textContent = "Select at least one event detector.";
+    status.textContent = "Select at least one event detector.";
     return;
   }
   const features = Array.from(
     exportFeatures.querySelectorAll("input:checked"),
     (input) => /** @type {HTMLInputElement} */ (input).value,
   );
-  exportStatus.textContent = "Preparing encountered events export…";
+  status.textContent = "Preparing encountered events export…";
   try {
     const url = new URL("/api/v1/events/export", location.origin);
     url.searchParams.set("symbol", activeSelection.symbol);
@@ -1318,12 +1326,16 @@ async function downloadEvents(format) {
     link.download = `encountered_events_${format}.zip`;
     link.click();
     setTimeout(() => URL.revokeObjectURL(address), 1000);
-    exportStatus.textContent = "Encountered events export downloaded.";
+    status.textContent = "Encountered events export downloaded.";
   } catch (error) {
-    exportStatus.textContent = `Event export failed: ${error instanceof Error ? error.message : String(error)}`;
+    status.textContent = `Event export failed: ${error instanceof Error ? error.message : String(error)}`;
   }
 }
 exportEventsCsv.addEventListener("click", () => void downloadEvents("csv"));
+exportLabelsCsv.addEventListener(
+  "click",
+  () => void downloadEvents("csv", selectedDetectorIds()),
+);
 exportEventsParquet.addEventListener(
   "click",
   () => void downloadEvents("parquet"),

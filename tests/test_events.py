@@ -296,50 +296,6 @@ detector = EventDetector("custom_rising", "Custom rising close", detect,
     ]
 
 
-def test_three_bullish_candles_signals_once_per_run_and_is_auto_exposed(tmp_path: Path) -> None:
-    root = tmp_path / "market"
-    root.mkdir()
-    source = root / "RISING_H1.csv"
-    source.write_text(
-        "time,open,high,low,close,volume\n"
-        + "".join(
-            f"{time},{opening},{max(opening, closing) + 1},"
-            f"{min(opening, closing) - 1},{closing},1\n"
-            for time, (opening, closing) in enumerate(
-                [(1, 2), (2, 3), (3, 4), (4, 5), (5, 5), (5, 6), (6, 7), (7, 8)],
-                start=1,
-            )
-        ),
-        encoding="utf-8",
-    )
-    with TestClient(create_app(Settings(root))) as client:
-        catalog = client.get("/api/v1/features").json()["event_detectors"]
-        response = client.get(
-            "/api/v1/events",
-            params={"symbol": "RISING", "timeframe": "H1", "detectors": "three_bullish_candles"},
-        )
-        exported = client.get(
-            "/api/v1/events/export",
-            params={
-                "symbol": "RISING",
-                "timeframe": "H1",
-                "detectors": "three_bullish_candles",
-                "format": "csv",
-            },
-        )
-    assert "three_bullish_candles" in {entry["id"] for entry in catalog}
-    assert response.status_code == 200
-    events = response.json()["events"]
-    assert [event["signal_time"] for event in events] == [3, 8]
-    assert all(event["broken_level"] is None for event in events)
-    assert [event["reason"] for event in events] == ["three consecutive bullish candles"] * 2
-    assert exported.status_code == 200
-    with zipfile.ZipFile(io.BytesIO(exported.content)) as archive:
-        frame = pd.read_csv(archive.open("encountered_events.csv"))
-    assert frame["id"].tolist() == [event["id"] for event in events]
-    assert frame["broken_level"].isna().all()
-
-
 @pytest.mark.parametrize(
     ("invalid_field", "invalid_value", "expected_error"),
     [

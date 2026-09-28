@@ -120,6 +120,7 @@ header {
   display: flex;
   flex-direction: column;
   min-height: 0;
+  height: calc(100vh - 230px);
 }
 #events-panel[hidden] {
   display: none;
@@ -217,6 +218,7 @@ header {
   font-size: 12px;
 }
 #event-details {
+  flex-shrink: 0;
   max-height: 70px;
   overflow-y: auto;
   font-size: 13px;
@@ -281,6 +283,11 @@ h1 {
   }
   .indicators-panel {
     max-height: 360px;
+  }
+  #events-panel {
+    height: min(70vh, 560px);
+    min-height: 420px;
+    max-height: none;
   }
   .event-filters {
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);

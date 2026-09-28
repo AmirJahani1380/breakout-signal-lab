@@ -33,6 +33,21 @@ def test_event_chart_overlay_matches_api_record(page: Page, viewer_url: str) -> 
     assert str(record["setup_id"]) in page.locator("#event-details").inner_text()
 
 
+def test_selected_event_details_remain_visible_on_narrow_chart(page: Page, viewer_url: str) -> None:
+    page.set_viewport_size({"width": 460, "height": 900})
+    page.goto(viewer_url)
+    page.locator("#symbol").select_option("BREAKOUT")
+    page.get_by_role("button", name="H1").click()
+    page.get_by_role("tab", name="Events").click()
+    page.locator("#event-list button").first.click()
+    assert page.locator("#event-details").evaluate(
+        "element => element.getBoundingClientRect().height >= 50"
+    )
+    assert page.locator("#event-list").evaluate(
+        "element => element.getBoundingClientRect().height >= 50"
+    )
+
+
 def test_fixed_2r_chart_details_agree_with_downloaded_csv(
     page: Page, viewer_url: str, tmp_path: Path
 ) -> None:
@@ -41,6 +56,10 @@ def test_fixed_2r_chart_details_agree_with_downloaded_csv(
     page.get_by_role("button", name="H1").click()
     page.wait_for_function("document.querySelector('#chart').dataset.barCount === '7'")
     page.get_by_role("tab", name="Events").click()
+    assert page.locator("#label-horizon").input_value() == "30"
+    assert page.locator("#event-detectors input").evaluate_all(
+        "inputs => inputs.map(input => input.value)"
+    ) == ["ema_breakout", "swing_breakout"]
     page.locator(".label-settings summary").click()
     page.locator("#label-atr-period").fill("1")
     page.locator("#label-atr-period").press("Tab")
@@ -69,6 +88,31 @@ def test_fixed_2r_chart_details_agree_with_downloaded_csv(
     assert float(
         page.locator("#chart").get_attribute("data-selected-target-price")
     ) == pytest.approx(selected["target_price"])
+
+    with page.expect_download() as transfer:
+        page.get_by_role("button", name="Download labels CSV").click()
+    label_archive_path = tmp_path / transfer.value.suggested_filename
+    transfer.value.save_as(label_archive_path)
+    with ZipFile(label_archive_path) as archive:
+        labels = pd.read_csv(archive.open("encountered_events.csv"))
+    label_row = labels.loc[labels["id"] == identifier].iloc[0]
+    assert label_row["entry_open"] == selected["entry_open"]
+    assert label_row["stop_price"] == pytest.approx(selected["stop_price"])
+    assert label_row["risk_price"] == pytest.approx(selected["risk_price"])
+    assert label_row["target_price"] == pytest.approx(selected["target_price"])
+    assert (
+        page.locator("#export-labels-status").inner_text()
+        == "Encountered events export downloaded."
+    )
+
+    def fail_labels_export(route: object) -> None:
+        route.fulfill(status=422, json={"detail": "fixture export failure"})  # type: ignore[attr-defined]
+
+    page.route("**/api/v1/events/export?*", fail_labels_export)
+    page.get_by_role("button", name="Download labels CSV").click()
+    page.get_by_text("Event export failed: fixture export failure").wait_for()
+    assert page.locator("#export-labels-status").is_visible()
+    page.unroute("**/api/v1/events/export?*", fail_labels_export)
 
     page.get_by_role("tab", name="Export").click()
     while page.locator("#export-features input:checked").count():
@@ -272,32 +316,6 @@ def test_swing_breakouts_and_donchian_channel_in_browser(page: Page, viewer_url:
         "window.__breakoutChart.panes()[0].getSeries().slice(-3).map(s => s.data().at(-1).value)"
     )
     assert sorted(series) == [6, 9.5, 13]
-
-
-def test_level_free_event_has_marker_without_broken_level_line(page: Page, viewer_url: str) -> None:
-    page.goto(viewer_url)
-    page.locator("#symbol").select_option("CANDLES")
-    page.get_by_role("button", name="H1").click()
-    page.wait_for_function("document.querySelector('#chart').dataset.barCount === '7'")
-    page.get_by_role("tab", name="Events").click()
-    candle_event = page.locator('#event-list button[data-detector="three_bullish_candles"]').first
-    candle_event.click()
-    assert page.locator("#chart").get_attribute("data-selected-broken-level") == ""
-    assert "broken level" not in page.locator("#event-details").inner_text()
-    assert int(page.locator("#chart").get_attribute("data-event-marker-count")) > 0
-    page.locator(".detector-settings summary").click()
-    setting = page.locator('input[data-detector-setting="three_bullish_candles.minimum_body"]')
-    assert setting.count() == 1
-    setting.fill("")
-    setting.dispatch_event("change")
-    assert setting.evaluate("input => input.validity.valueMissing")
-    assert page.locator("#chart").get_attribute("data-bar-count") == "7"
-    assert candle_event.is_visible()
-    setting.fill("2")
-    setting.dispatch_event("change")
-    page.wait_for_function(
-        "!document.querySelector('#event-list button[data-detector=three_bullish_candles]')"
-    )
 
 
 def test_swing_indicator_controls_pivot_dots_on_the_chart(page: Page, viewer_url: str) -> None:

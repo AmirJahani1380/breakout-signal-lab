@@ -70,7 +70,7 @@ def register_event_routes(app: FastAPI, source_timezone: str, page_size: int) ->
                 raise ValueError(f"{name} must be a finite non-negative number") from error
 
         return LabelConfig(
-            horizon=integer("label_horizon", 20),
+            horizon=integer("label_horizon", 30),
             atr_period=integer("label_atr_period", 20),
             atr_buffer=number("label_atr_buffer", 0.05),
             slippage=number("label_slippage", 0),
