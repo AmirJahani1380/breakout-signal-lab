@@ -88,6 +88,29 @@ Additional CSV and Parquet columns are retained in `BarStore.imported_features`,
 
 Selecting a timeframe validates the complete selected source, including timestamp syntax and order, duplicate timestamps, numeric price/volume values, and OHLC geometry. An unavailable data root returns HTTP 503; an invalid selection or malformed source returns a clear HTTP 422 response with its original source row or CSV record number.
 
+## Breakout ML research
+
+Install `pip install -e ".[ml]"` and open `ML/breakout_research.ipynb` from the repository root.
+The notebook reads the canonical `XAUUSDzero_D1_max_bars.csv` in the sibling
+`data analysis/mt5_data` directory by default. Set `BREAKOUT_SOURCE` to another
+copy of that XAUUSDzero D1 source before starting Jupyter if needed. Its first run writes separate
+`exports/ML/ema_breakout.parquet` and `exports/ML/swing_breakout.parquet` with
+JSON sidecars; these ignored research outputs are never replaced automatically.
+Delete or move an old pair deliberately to regenerate after source or code changes.
+The sidecars record the source SHA-256 and the exact feature, detector and label
+settings. The notebook checks that fingerprint before analysis.
+
+Only the eight registered, signal-time normalized features and event direction
+enter the models. OHLC/raw prices, timestamps, entry/exit fields, MAE/MFE,
+returns, and outcomes remain audit data, not predictors. Complete 30-bar `target_first` events are 1; complete
+`stop_first` and `timeout` events are 0. Ambiguous, censored, unfilled,
+invalid-entry and missing-feature events are counted but not modeled. Fixed
+2R labels use 20-bar ATR, 0.05 ATR stop buffer, zero slippage and zero
+commission. Net R therefore has zero transaction costs. MAE/MFE are descriptive
+R-multiple excursions over the entire available observation window, including
+bars after an early exit; they are not model inputs. This is one market's
+observational backtest, not evidence of live execution or future profitability.
+
 ## Verification
 
 ```powershell
